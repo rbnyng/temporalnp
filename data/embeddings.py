@@ -334,7 +334,7 @@ class EmbeddingExtractor:
         Generate a cache key for extracted embedding-shot pairs.
 
         The key is based on:
-        - Shot locations (lat/lon rounded to 6 decimals)
+        - Shot locations (lat/lon rounded to 6 decimals, sorted for order-independence)
         - Extraction parameters (year, patch_size)
 
         Args:
@@ -344,9 +344,12 @@ class EmbeddingExtractor:
             MD5 hash string
         """
         # Create a deterministic representation of the shots
-        # Round coordinates to avoid floating point issues
+        # Round coordinates and SORT to make hash order-independent
         coords = gedi_df[['longitude', 'latitude']].round(6).values
-        coords_bytes = coords.tobytes()
+        # Sort by (lon, lat) to ensure same hash regardless of row order
+        sorted_indices = np.lexsort((coords[:, 1], coords[:, 0]))
+        coords_sorted = coords[sorted_indices]
+        coords_bytes = coords_sorted.tobytes()
 
         # Include extraction parameters
         params = {
@@ -378,6 +381,9 @@ class EmbeddingExtractor:
         """
         Load cached embedding-shot pairs.
 
+        Patches are stored in sorted coordinate order. We reorder them to match
+        the current DataFrame's row order using coordinate matching.
+
         Args:
             cache_path: Path to cache file
             gedi_df: Original DataFrame to attach embeddings to
@@ -387,27 +393,36 @@ class EmbeddingExtractor:
         """
         try:
             data = np.load(cache_path, allow_pickle=True)
-            patches = data['patches']
+            patches = data['patches']  # In sorted order
 
-            # Verify alignment
+            # Verify count matches
             if len(patches) != len(gedi_df):
                 print(f"  Cache size mismatch: {len(patches)} vs {len(gedi_df)} shots")
                 return None
 
-            # Verify coordinates hash if available (for cache integrity)
+            # Get current DataFrame's coordinates and compute sort order
+            coords = gedi_df[['longitude', 'latitude']].round(6).values
+            sorted_indices = np.lexsort((coords[:, 1], coords[:, 0]))
+
+            # Verify sorted coords hash matches (for integrity)
             if 'coords_hash' in data:
-                expected_hash = hashlib.md5(
-                    gedi_df[['longitude', 'latitude']].round(6).values.tobytes()
-                ).hexdigest()
+                coords_sorted = coords[sorted_indices]
+                expected_hash = hashlib.md5(coords_sorted.tobytes()).hexdigest()
                 if str(data['coords_hash']) != expected_hash:
                     print(f"  Cache coords mismatch, re-extracting")
                     return None
+
+            # Reorder patches from sorted order back to DataFrame order
+            # sorted_indices[i] = where row i should go in sorted order
+            # We need inverse: for each position in sorted, which original row?
+            inverse_indices = np.argsort(sorted_indices)
+            patches_reordered = patches[inverse_indices]
 
             # Reconstruct DataFrame
             gedi_df = gedi_df.copy()
             gedi_df['embedding_patch'] = [
                 p if not np.isnan(p).all() else None
-                for p in patches
+                for p in patches_reordered
             ]
 
             return gedi_df
@@ -424,16 +439,23 @@ class EmbeddingExtractor:
         """
         Save extracted embedding-shot pairs to cache.
 
+        Patches are stored in sorted coordinate order for order-independent caching.
+        This allows the same cache to be reused regardless of DataFrame row order.
+
         Args:
             cache_path: Path to cache file
             gedi_df: DataFrame with embedding_patch column
         """
+        # Get sort order for coordinates
+        coords = gedi_df[['longitude', 'latitude']].round(6).values
+        sorted_indices = np.lexsort((coords[:, 1], coords[:, 0]))
+
         # Convert patches to numpy array (use NaN for None patches)
-        patches = []
+        patches_list = list(gedi_df['embedding_patch'])
         patch_shape = None
 
         # First pass: find valid patch shape
-        for patch in gedi_df['embedding_patch']:
+        for patch in patches_list:
             if patch is not None:
                 patch_shape = patch.shape
                 break
@@ -442,8 +464,10 @@ class EmbeddingExtractor:
             print("  Warning: No valid patches to cache")
             return
 
-        # Second pass: convert to array with NaN for missing
-        for patch in gedi_df['embedding_patch']:
+        # Second pass: convert to array with NaN for missing, in sorted order
+        patches = []
+        for idx in sorted_indices:
+            patch = patches_list[idx]
             if patch is not None:
                 patches.append(patch)
             else:
@@ -451,10 +475,9 @@ class EmbeddingExtractor:
 
         patches_array = np.array(patches)
 
-        # Save to cache with metadata for verification
-        coords_hash = hashlib.md5(
-            gedi_df[['longitude', 'latitude']].round(6).values.tobytes()
-        ).hexdigest()
+        # Hash of sorted coordinates for integrity verification
+        coords_sorted = coords[sorted_indices]
+        coords_hash = hashlib.md5(coords_sorted.tobytes()).hexdigest()
 
         np.savez_compressed(
             cache_path,
