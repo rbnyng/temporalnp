@@ -408,7 +408,7 @@ def main():
             continue
 
         extractor.set_year(year)  # Switch year without reinitializing GeoTessera
-        year_df = extractor.extract_patches_batch(year_df, verbose=True)
+        year_df = extractor.extract_patches_batch(year_df, verbose=True, cache_dir=args.cache_dir)
         all_dfs.append(year_df)
 
     gedi_df = pd.concat(all_dfs, ignore_index=True)

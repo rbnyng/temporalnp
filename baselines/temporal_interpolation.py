@@ -1,14 +1,13 @@
 """
-Temporal Linear Interpolation Baseline.
+Temporal Baselines for Disturbance Detection.
 
-This baseline:
-1. Trains a spatial-only model on pre-event data (e.g., 2019-2020)
-2. Trains a spatial-only model on post-event data (e.g., 2022-2023)
-3. For test points in the event year (e.g., 2021), linearly interpolates
-   predictions based on timestamp
+Supports multiple baseline modes:
+- 'interpolation': Train pre/post models, linearly interpolate by timestamp
+- 'pre_only': Train only on pre-event data, predict using historical context
+- 'post_only': Train only on post-event data (oracle baseline)
+- 'mean': Average of pre and post predictions (no temporal weighting)
 
-This encodes the assumption that biomass changes smoothly over time,
-which will fail for abrupt disturbance events like fires.
+All baselines use tile-based context selection (same as main model) for fair comparison.
 """
 
 import argparse
@@ -35,7 +34,13 @@ from utils.normalization import normalize_coords, normalize_agbd, denormalize_ag
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Temporal Interpolation Baseline')
+    parser = argparse.ArgumentParser(description='Temporal Baselines for Disturbance Detection')
+
+    # Baseline mode
+    parser.add_argument('--mode', type=str, default='interpolation',
+                        choices=['interpolation', 'pre_only', 'post_only', 'mean'],
+                        help='Baseline mode: interpolation (linear blend), pre_only (historical), '
+                             'post_only (oracle), mean (simple average)')
 
     parser.add_argument('--region_bbox', type=float, nargs=4, required=True,
                         help='Region bounding box')
@@ -53,12 +58,10 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=5e-4)
-    parser.add_argument('--n_context', type=int, default=100,
-                        help='Number of nearest context points for prediction')
     parser.add_argument('--max_context_shots', type=int, default=1024,
-                        help='Max context shots per tile during training (runtime subsampling)')
+                        help='Max context shots per tile during training/inference')
     parser.add_argument('--max_target_shots', type=int, default=1024,
-                        help='Max target shots per tile during training (runtime subsampling)')
+                        help='Max target shots per tile during training/inference')
     parser.add_argument('--early_stopping_patience', type=int, default=25,
                         help='Early stopping patience')
     parser.add_argument('--lr_scheduler_patience', type=int, default=5,
@@ -240,67 +243,101 @@ def train_spatial_model(
     return model, {'best_val_loss': best_val_loss, 'best_r2': best_r2}
 
 
-def predict_with_model(
+def predict_with_tile_context(
     model: GEDINeuralProcess,
     context_df: pd.DataFrame,
     test_df: pd.DataFrame,
     global_bounds: Tuple[float, float, float, float],
     device: str,
-    n_context: int = 100
+    max_context_shots: int = 1024
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Generate predictions for test points using k-NN context selection."""
-    from scipy.spatial import cKDTree
+    """
+    Generate predictions using tile-based context selection.
 
+    For each test tile, uses all context points from the same tile as context.
+    This matches the main model's evaluation approach for fair comparison.
+    """
     model.eval()
-    predictions = []
-    uncertainties = []
 
-    # Build KD-tree for context point lookup
-    context_coords = context_df[['longitude', 'latitude']].values
-    context_embeddings = np.stack(context_df['embedding_patch'].values)
-    context_agbd = context_df['agbd'].values[:, None]
-    context_tree = cKDTree(context_coords)
+    # Group test points by tile
+    test_tiles = test_df['tile_id'].unique()
+
+    all_predictions = []
+    all_uncertainties = []
+    all_indices = []
 
     lon_min, lat_min, lon_max, lat_max = global_bounds
 
     with torch.no_grad():
-        for idx in tqdm(range(len(test_df)), desc='Predicting'):
-            row = test_df.iloc[idx]
-            query_coord = np.array([[row['longitude'], row['latitude']]])
+        for tile_id in tqdm(test_tiles, desc='Predicting by tile'):
+            # Get test points for this tile
+            tile_test = test_df[test_df['tile_id'] == tile_id]
+            tile_indices = tile_test.index.tolist()
 
-            # Find k nearest context points
-            _, nn_indices = context_tree.query(query_coord[0], k=min(n_context, len(context_df)))
-            if isinstance(nn_indices, np.integer):
-                nn_indices = [nn_indices]
+            # Get context points for this tile (from context_df)
+            tile_context = context_df[context_df['tile_id'] == tile_id]
 
-            # Get context subset
-            ctx_coords = context_coords[nn_indices]
-            ctx_embeddings = context_embeddings[nn_indices]
-            ctx_agbd = context_agbd[nn_indices]
+            if len(tile_context) == 0:
+                # No context for this tile, use NaN predictions
+                all_predictions.extend([np.nan] * len(tile_test))
+                all_uncertainties.extend([np.nan] * len(tile_test))
+                all_indices.extend(tile_indices)
+                continue
 
-            # Normalize using utility functions
+            # Prepare context
+            ctx_coords = tile_context[['longitude', 'latitude']].values
+            ctx_embeddings = np.stack(tile_context['embedding_patch'].values)
+            ctx_agbd = tile_context['agbd'].values[:, None]
+
+            # Subsample context if too large
+            if len(ctx_coords) > max_context_shots:
+                indices = np.random.choice(len(ctx_coords), max_context_shots, replace=False)
+                ctx_coords = ctx_coords[indices]
+                ctx_embeddings = ctx_embeddings[indices]
+                ctx_agbd = ctx_agbd[indices]
+
+            # Normalize
             ctx_coords_norm = normalize_coords(ctx_coords, global_bounds)
             ctx_agbd_norm = normalize_agbd(ctx_agbd)
-            query_coord_norm = normalize_coords(query_coord, global_bounds)
 
-            query_embedding = row['embedding_patch'][np.newaxis, ...]
+            # Prepare targets
+            tgt_coords = tile_test[['longitude', 'latitude']].values
+            tgt_embeddings = np.stack(tile_test['embedding_patch'].values)
+            tgt_coords_norm = normalize_coords(tgt_coords, global_bounds)
 
             # To tensors
             ctx_coords_t = torch.from_numpy(ctx_coords_norm).float().to(device)
             ctx_embeddings_t = torch.from_numpy(ctx_embeddings).float().to(device)
             ctx_agbd_t = torch.from_numpy(ctx_agbd_norm).float().to(device)
-            query_coords_t = torch.from_numpy(query_coord_norm).float().to(device)
-            query_embeddings_t = torch.from_numpy(query_embedding).float().to(device)
+            tgt_coords_t = torch.from_numpy(tgt_coords_norm).float().to(device)
+            tgt_embeddings_t = torch.from_numpy(tgt_embeddings).float().to(device)
 
+            # Predict
             pred_mean, pred_std = model.predict(
                 ctx_coords_t, ctx_embeddings_t, ctx_agbd_t,
-                query_coords_t, query_embeddings_t
+                tgt_coords_t, tgt_embeddings_t
             )
 
-            predictions.append(pred_mean.cpu().numpy().item())
-            uncertainties.append(pred_std.cpu().numpy().item())
+            all_predictions.extend(pred_mean.cpu().numpy().flatten().tolist())
+            all_uncertainties.extend(pred_std.cpu().numpy().flatten().tolist())
+            all_indices.extend(tile_indices)
 
-    return np.array(predictions), np.array(uncertainties)
+            # Clear GPU cache
+            if 'cuda' in str(device):
+                torch.cuda.empty_cache()
+
+    # Reorder to match original test_df order
+    result_df = pd.DataFrame({
+        'idx': all_indices,
+        'pred': all_predictions,
+        'unc': all_uncertainties
+    }).set_index('idx')
+
+    # Align with test_df index
+    predictions = result_df.loc[test_df.index, 'pred'].values
+    uncertainties = result_df.loc[test_df.index, 'unc'].values
+
+    return predictions, uncertainties
 
 
 def compute_disturbance_analysis(
@@ -466,9 +503,17 @@ def main():
     all_years = sorted(set(args.pre_years + args.post_years + [args.test_year]))
     train_years = args.pre_years + args.post_years
 
+    mode_names = {
+        'interpolation': 'Temporal Linear Interpolation',
+        'pre_only': 'Pre-Event Only (Historical)',
+        'post_only': 'Post-Event Only (Oracle)',
+        'mean': 'Mean of Pre/Post'
+    }
+
     print("=" * 80)
-    print("Temporal Linear Interpolation Baseline")
+    print(f"Baseline: {mode_names[args.mode]}")
     print("=" * 80)
+    print(f"Mode: {args.mode}")
     print(f"Pre-event years: {args.pre_years}")
     print(f"Post-event years: {args.post_years}")
     print(f"Test year: {args.test_year}")
@@ -497,7 +542,7 @@ def main():
         if len(year_df) == 0:
             continue
         extractor.set_year(year)
-        year_df = extractor.extract_patches_batch(year_df, verbose=True)
+        year_df = extractor.extract_patches_batch(year_df, verbose=True, cache_dir=args.cache_dir)
         all_dfs.append(year_df)
 
     gedi_df = pd.concat(all_dfs, ignore_index=True)
@@ -509,9 +554,6 @@ def main():
         buffer_size=0.1, random_state=args.seed
     )
     train_df_full, val_df_full, test_df = splitter.split()
-
-    # Get test tile IDs
-    test_tiles = splitter.test_tiles
 
     # Split train data into pre and post
     pre_train_df = train_df_full[train_df_full['year'].isin(args.pre_years)]
@@ -528,79 +570,124 @@ def main():
         gedi_df['longitude'].max(), gedi_df['latitude'].max()
     )
 
-    # Train pre-event model
-    pre_model, pre_metrics = train_spatial_model(
-        pre_train_df, pre_val_df, global_bounds, args, "Pre-event model",
-        max_context_shots=args.max_context_shots, max_target_shots=args.max_target_shots
-    )
-    torch.save(pre_model.state_dict(), output_dir / 'pre_model.pt')
+    # Train models based on mode
+    pre_model, post_model = None, None
+    pred_pre, unc_pre = None, None
+    pred_post, unc_post = None, None
 
-    # Train post-event model
-    post_model, post_metrics = train_spatial_model(
-        post_train_df, post_val_df, global_bounds, args, "Post-event model",
-        max_context_shots=args.max_context_shots, max_target_shots=args.max_target_shots
-    )
-    torch.save(post_model.state_dict(), output_dir / 'post_model.pt')
+    # Determine which models to train
+    need_pre = args.mode in ['interpolation', 'pre_only', 'mean']
+    need_post = args.mode in ['interpolation', 'post_only', 'mean']
 
-    # Generate predictions for test set from both models
-    print(f"\nGenerating predictions (n_context={args.n_context})...")
+    if need_pre:
+        pre_model, pre_metrics = train_spatial_model(
+            pre_train_df, pre_val_df, global_bounds, args, "Pre-event model",
+            max_context_shots=args.max_context_shots, max_target_shots=args.max_target_shots
+        )
+        torch.save(pre_model.state_dict(), output_dir / 'pre_model.pt')
 
-    # Use all pre-event data as context for pre-model
-    pre_context = gedi_df[gedi_df['year'].isin(args.pre_years)]
-    pred_pre, unc_pre = predict_with_model(
-        pre_model, pre_context, test_df, global_bounds, args.device, args.n_context
-    )
+        # Generate predictions using tile-based context
+        print("\nGenerating pre-event predictions (tile-based context)...")
+        pre_context = gedi_df[gedi_df['year'].isin(args.pre_years)]
+        pred_pre, unc_pre = predict_with_tile_context(
+            pre_model, pre_context, test_df, global_bounds, args.device,
+            max_context_shots=args.max_context_shots
+        )
 
-    # Use all post-event data as context for post-model
-    post_context = gedi_df[gedi_df['year'].isin(args.post_years)]
-    pred_post, unc_post = predict_with_model(
-        post_model, post_context, test_df, global_bounds, args.device, args.n_context
-    )
+    if need_post:
+        post_model, post_metrics = train_spatial_model(
+            post_train_df, post_val_df, global_bounds, args, "Post-event model",
+            max_context_shots=args.max_context_shots, max_target_shots=args.max_target_shots
+        )
+        torch.save(post_model.state_dict(), output_dir / 'post_model.pt')
 
-    # Temporal interpolation with proper variance blending
-    pre_end = pd.Timestamp(f'{max(args.pre_years)}-12-31')
-    post_start = pd.Timestamp(f'{min(args.post_years)}-01-01')
-    pred_interp, unc_interp, alpha = temporal_interpolation(
-        pred_pre, pred_post, unc_pre, unc_post,
-        test_df['time'], pre_end, post_start
-    )
+        # Generate predictions using tile-based context
+        print("\nGenerating post-event predictions (tile-based context)...")
+        post_context = gedi_df[gedi_df['year'].isin(args.post_years)]
+        pred_post, unc_post = predict_with_tile_context(
+            post_model, post_context, test_df, global_bounds, args.device,
+            max_context_shots=args.max_context_shots
+        )
 
-    # Denormalize predictions using delta method
-    pred_pre_linear = denormalize_agbd(pred_pre)
-    pred_post_linear = denormalize_agbd(pred_post)
-    pred_interp_linear = denormalize_agbd(pred_interp)
+    # Combine predictions based on mode
+    if args.mode == 'interpolation':
+        # Linear interpolation based on timestamp
+        pre_end = pd.Timestamp(f'{max(args.pre_years)}-12-31')
+        post_start = pd.Timestamp(f'{min(args.post_years)}-01-01')
+        pred_final, unc_final, alpha = temporal_interpolation(
+            pred_pre, pred_post, unc_pre, unc_post,
+            test_df['time'], pre_end, post_start
+        )
+    elif args.mode == 'pre_only':
+        # Only use pre-event predictions
+        pred_final = pred_pre
+        unc_final = unc_pre
+        alpha = np.zeros(len(test_df))
+    elif args.mode == 'post_only':
+        # Only use post-event predictions (oracle)
+        pred_final = pred_post
+        unc_final = unc_post
+        alpha = np.ones(len(test_df))
+    elif args.mode == 'mean':
+        # Simple average of pre and post (no temporal weighting)
+        pred_final = (pred_pre + pred_post) / 2
+        # Combine variances: Var((X+Y)/2) = (Var(X) + Var(Y)) / 4
+        unc_final = np.sqrt((unc_pre**2 + unc_post**2) / 4)
+        alpha = np.full(len(test_df), 0.5)
+
+    # Handle NaN predictions (tiles with no context)
+    valid_mask = ~np.isnan(pred_final)
+    if not valid_mask.all():
+        n_invalid = (~valid_mask).sum()
+        print(f"\nWarning: {n_invalid} predictions are NaN (tiles without context)")
+
+    # Denormalize predictions
+    pred_final_linear = denormalize_agbd(pred_final)
     target_linear = test_df['agbd'].values
+    unc_final_linear = denormalize_std(unc_final, pred_final)
 
-    # Denormalize uncertainties using delta method (requires corresponding mean)
-    unc_pre_linear = denormalize_std(unc_pre, pred_pre)
-    unc_post_linear = denormalize_std(unc_post, pred_post)
-    unc_interp_linear = denormalize_std(unc_interp, pred_interp)
+    # Also denormalize pre/post for saving
+    if pred_pre is not None:
+        pred_pre_linear = denormalize_agbd(pred_pre)
+        unc_pre_linear = denormalize_std(unc_pre, pred_pre)
+    if pred_post is not None:
+        pred_post_linear = denormalize_agbd(pred_post)
+        unc_post_linear = denormalize_std(unc_post, pred_post)
 
-    # Compute metrics
+    # Compute metrics (only on valid predictions)
     from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
-    rmse = np.sqrt(mean_squared_error(target_linear, pred_interp_linear))
-    mae = mean_absolute_error(target_linear, pred_interp_linear)
-    r2 = r2_score(target_linear, pred_interp_linear)
+    valid_pred = pred_final_linear[valid_mask]
+    valid_target = target_linear[valid_mask]
+    valid_unc = unc_final_linear[valid_mask]
+
+    rmse = np.sqrt(mean_squared_error(valid_target, valid_pred))
+    mae = mean_absolute_error(valid_target, valid_pred)
+    r2 = r2_score(valid_target, valid_pred)
 
     # Log-space metrics
     target_log = normalize_agbd(target_linear)
-    log_rmse = np.sqrt(mean_squared_error(target_log, pred_interp))
-    log_r2 = r2_score(target_log, pred_interp)
+    valid_target_log = target_log[valid_mask]
+    valid_pred_log = pred_final[valid_mask]
+    valid_unc_log = unc_final[valid_mask]
+
+    log_rmse = np.sqrt(mean_squared_error(valid_target_log, valid_pred_log))
+    log_r2 = r2_score(valid_target_log, valid_pred_log)
 
     # UQ calibration metrics (in log space)
-    calibration = compute_calibration_metrics(pred_interp, target_log, unc_interp)
+    calibration = compute_calibration_metrics(valid_pred_log, valid_target_log, valid_unc_log)
 
-    # Disturbance analysis: correlate tile-level disturbance with prediction error
+    # Disturbance analysis
     disturbance_analysis = compute_disturbance_analysis(
-        gedi_df, test_df, pred_interp_linear,
+        gedi_df, test_df, pred_final_linear,
         args.pre_years, args.post_years, args.test_year
     )
 
     print("\n" + "=" * 80)
-    print("RESULTS: Temporal Linear Interpolation Baseline")
+    print(f"RESULTS: {mode_names[args.mode]} Baseline")
     print("=" * 80)
     print(f"Test year: {args.test_year}")
+    print(f"Valid predictions: {valid_mask.sum()}/{len(test_df)}")
     print(f"Linear R²: {r2:.4f}")
     print(f"RMSE: {rmse:.2f} Mg/ha")
     print(f"MAE: {mae:.2f} Mg/ha")
@@ -618,7 +705,8 @@ def main():
     print(f"  Tiles with biomass loss: {disturbance_analysis['summary']['n_tiles_with_loss']}")
     print(f"  Tiles with major loss (>30%): {disturbance_analysis['summary']['pct_tiles_major_loss']:.1f}%")
     if disturbance_analysis['correlation']['pearson_r'] is not None:
-        print(f"  Error-disturbance correlation: r={disturbance_analysis['correlation']['pearson_r']:.3f} (p={disturbance_analysis['correlation']['p_value']:.3f})")
+        print(f"  Error-disturbance correlation: r={disturbance_analysis['correlation']['pearson_r']:.3f} "
+              f"(p={disturbance_analysis['correlation']['p_value']:.3f})")
     if disturbance_analysis['quartile_rmse']:
         print(f"  RMSE by disturbance quartile:")
         for q, rmse_val in disturbance_analysis['quartile_rmse'].items():
@@ -626,11 +714,13 @@ def main():
 
     # Save results
     results = {
-        'method': 'temporal_linear_interpolation',
+        'method': args.mode,
+        'method_name': mode_names[args.mode],
         'pre_years': args.pre_years,
         'post_years': args.post_years,
         'test_year': args.test_year,
-        'n_context': args.n_context,
+        'context_selection': 'tile_based',
+        'max_context_shots': args.max_context_shots,
         'metrics': {
             'linear_r2': float(r2),
             'linear_rmse': float(rmse),
@@ -640,11 +730,12 @@ def main():
         },
         'calibration': calibration,
         'n_test_shots': len(test_df),
+        'n_valid_predictions': int(valid_mask.sum()),
         'alpha_stats': {
-            'mean': float(alpha.mean()),
-            'std': float(alpha.std()),
-            'min': float(alpha.min()),
-            'max': float(alpha.max())
+            'mean': float(np.nanmean(alpha)),
+            'std': float(np.nanstd(alpha)),
+            'min': float(np.nanmin(alpha)),
+            'max': float(np.nanmax(alpha))
         },
         'disturbance': {
             'correlation': disturbance_analysis['correlation'],
@@ -658,14 +749,19 @@ def main():
 
     # Save predictions for analysis
     test_df_out = test_df[['latitude', 'longitude', 'agbd', 'time', 'tile_id']].copy()
-    test_df_out['pred_pre'] = pred_pre_linear
-    test_df_out['pred_post'] = pred_post_linear
-    test_df_out['pred_interp'] = pred_interp_linear
-    test_df_out['unc_pre'] = unc_pre_linear
-    test_df_out['unc_post'] = unc_post_linear
-    test_df_out['unc_interp'] = unc_interp_linear
+    test_df_out['pred_final'] = pred_final_linear
+    test_df_out['unc_final'] = unc_final_linear
     test_df_out['alpha'] = alpha
-    test_df_out['residual'] = target_linear - pred_interp_linear
+    test_df_out['residual'] = target_linear - pred_final_linear
+
+    # Add pre/post predictions if available
+    if pred_pre is not None:
+        test_df_out['pred_pre'] = pred_pre_linear
+        test_df_out['unc_pre'] = unc_pre_linear
+    if pred_post is not None:
+        test_df_out['pred_post'] = pred_post_linear
+        test_df_out['unc_post'] = unc_post_linear
+
     test_df_out.to_parquet(output_dir / 'predictions.parquet')
 
     # Save per-tile disturbance analysis
