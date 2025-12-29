@@ -4,6 +4,9 @@ from typing import Optional, Tuple, Dict
 import pandas as pd
 from pyproj import Transformer
 from tqdm import tqdm
+import hashlib
+import json
+from pathlib import Path
 
 
 class EmbeddingExtractor:
@@ -204,7 +207,8 @@ class EmbeddingExtractor:
         self,
         gedi_df: pd.DataFrame,
         verbose: bool = True,
-        desc: str = None
+        desc: str = None,
+        cache_dir: Optional[str] = None
     ) -> pd.DataFrame:
         """
         Extract patches for all GEDI shots in a DataFrame.
@@ -213,10 +217,30 @@ class EmbeddingExtractor:
             gedi_df: DataFrame with 'longitude', 'latitude' columns
             verbose: Show progress bar
             desc: Description for progress bar (default: "Extracting embeddings")
+            cache_dir: Directory for caching extracted embedding-shot pairs.
+                      If provided, will load from cache if available, otherwise
+                      extract and save to cache for future runs.
 
         Returns:
             DataFrame with added 'embedding_patch' column (None for failed extractions)
         """
+        # Check cache first
+        if cache_dir is not None:
+            cache_key = self._generate_extraction_cache_key(gedi_df)
+            cache_path = self._get_extraction_cache_path(cache_dir, cache_key)
+
+            if cache_path.exists():
+                if verbose:
+                    print(f"  Loading cached embeddings from {cache_path}")
+                cached_df = self._load_cached_extractions(cache_path, gedi_df)
+                if cached_df is not None:
+                    successful = cached_df['embedding_patch'].notna().sum()
+                    if verbose:
+                        print(f"  {successful}/{len(cached_df)} shots with valid embeddings "
+                              f"({100*successful/len(cached_df):.1f}%) [from cache]")
+                    return cached_df
+
+        # Extract embeddings
         patches = []
         successful = 0
 
@@ -239,6 +263,10 @@ class EmbeddingExtractor:
         if verbose:
             print(f"  {successful}/{len(gedi_df)} shots with valid embeddings "
                   f"({100*successful/len(gedi_df):.1f}%)")
+
+        # Save to cache
+        if cache_dir is not None:
+            self._save_extractions_to_cache(cache_path, gedi_df)
 
         return gedi_df
 
@@ -297,3 +325,131 @@ class EmbeddingExtractor:
     def clear_cache(self):
         """Clear in-memory tile cache."""
         self.tile_cache.clear()
+
+    def _generate_extraction_cache_key(
+        self,
+        gedi_df: pd.DataFrame,
+    ) -> str:
+        """
+        Generate a cache key for extracted embedding-shot pairs.
+
+        The key is based on:
+        - Shot locations (lat/lon rounded to 6 decimals)
+        - Extraction parameters (year, patch_size)
+
+        Args:
+            gedi_df: DataFrame with GEDI shots
+
+        Returns:
+            MD5 hash string
+        """
+        # Create a deterministic representation of the shots
+        # Round coordinates to avoid floating point issues
+        coords = gedi_df[['longitude', 'latitude']].round(6).values
+        coords_bytes = coords.tobytes()
+
+        # Include extraction parameters
+        params = {
+            'year': self.year,
+            'patch_size': self.patch_size,
+            'n_shots': len(gedi_df),
+        }
+        params_str = json.dumps(params, sort_keys=True)
+
+        # Combine and hash
+        combined = coords_bytes + params_str.encode()
+        return hashlib.md5(combined).hexdigest()
+
+    def _get_extraction_cache_path(
+        self,
+        cache_dir: str,
+        cache_key: str
+    ) -> Path:
+        """Get the path for an extraction cache file."""
+        cache_path = Path(cache_dir) / 'extracted_pairs'
+        cache_path.mkdir(parents=True, exist_ok=True)
+        return cache_path / f'embeddings_{cache_key}.npz'
+
+    def _load_cached_extractions(
+        self,
+        cache_path: Path,
+        gedi_df: pd.DataFrame
+    ) -> Optional[pd.DataFrame]:
+        """
+        Load cached embedding-shot pairs.
+
+        Args:
+            cache_path: Path to cache file
+            gedi_df: Original DataFrame to attach embeddings to
+
+        Returns:
+            DataFrame with embedding_patch column, or None if cache invalid
+        """
+        try:
+            data = np.load(cache_path, allow_pickle=True)
+            patches = data['patches']
+
+            # Verify alignment
+            if len(patches) != len(gedi_df):
+                print(f"  Cache size mismatch: {len(patches)} vs {len(gedi_df)} shots")
+                return None
+
+            # Reconstruct DataFrame
+            gedi_df = gedi_df.copy()
+            gedi_df['embedding_patch'] = [
+                p if not np.isnan(p).all() else None
+                for p in patches
+            ]
+
+            return gedi_df
+
+        except Exception as e:
+            print(f"  Failed to load cache: {e}")
+            return None
+
+    def _save_extractions_to_cache(
+        self,
+        cache_path: Path,
+        gedi_df: pd.DataFrame
+    ) -> None:
+        """
+        Save extracted embedding-shot pairs to cache.
+
+        Args:
+            cache_path: Path to cache file
+            gedi_df: DataFrame with embedding_patch column
+        """
+        # Convert patches to numpy array (use NaN for None patches)
+        patches = []
+        patch_shape = None
+
+        # First pass: find valid patch shape
+        for patch in gedi_df['embedding_patch']:
+            if patch is not None:
+                patch_shape = patch.shape
+                break
+
+        if patch_shape is None:
+            print("  Warning: No valid patches to cache")
+            return
+
+        # Second pass: convert to array with NaN for missing
+        for patch in gedi_df['embedding_patch']:
+            if patch is not None:
+                patches.append(patch)
+            else:
+                patches.append(np.full(patch_shape, np.nan))
+
+        patches_array = np.array(patches)
+
+        # Save to cache
+        np.savez_compressed(
+            cache_path,
+            patches=patches_array,
+            year=self.year,
+            patch_size=self.patch_size
+        )
+
+        # Report cache size
+        cache_size_mb = cache_path.stat().st_size / (1024 * 1024)
+        print(f"  Saved extraction cache ({cache_size_mb:.1f} MB): {cache_path}")

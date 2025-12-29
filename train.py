@@ -286,7 +286,7 @@ def main():
         patch_size=args.patch_size,
         embeddings_dir=args.embeddings_dir
     )
-    gedi_df = extractor.extract_patches_batch(gedi_df, verbose=True)
+    gedi_df = extractor.extract_patches_batch(gedi_df, verbose=True, cache_dir=args.cache_dir)
     print()
 
     gedi_df = gedi_df[gedi_df['embedding_patch'].notna()]

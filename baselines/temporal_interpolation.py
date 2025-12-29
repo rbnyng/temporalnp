@@ -497,7 +497,7 @@ def main():
         if len(year_df) == 0:
             continue
         extractor.set_year(year)
-        year_df = extractor.extract_patches_batch(year_df, verbose=True)
+        year_df = extractor.extract_patches_batch(year_df, verbose=True, cache_dir=args.cache_dir)
         all_dfs.append(year_df)
 
     gedi_df = pd.concat(all_dfs, ignore_index=True)
