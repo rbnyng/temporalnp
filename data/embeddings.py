@@ -394,6 +394,15 @@ class EmbeddingExtractor:
                 print(f"  Cache size mismatch: {len(patches)} vs {len(gedi_df)} shots")
                 return None
 
+            # Verify coordinates hash if available (for cache integrity)
+            if 'coords_hash' in data:
+                expected_hash = hashlib.md5(
+                    gedi_df[['longitude', 'latitude']].round(6).values.tobytes()
+                ).hexdigest()
+                if str(data['coords_hash']) != expected_hash:
+                    print(f"  Cache coords mismatch, re-extracting")
+                    return None
+
             # Reconstruct DataFrame
             gedi_df = gedi_df.copy()
             gedi_df['embedding_patch'] = [
@@ -442,12 +451,17 @@ class EmbeddingExtractor:
 
         patches_array = np.array(patches)
 
-        # Save to cache
+        # Save to cache with metadata for verification
+        coords_hash = hashlib.md5(
+            gedi_df[['longitude', 'latitude']].round(6).values.tobytes()
+        ).hexdigest()
+
         np.savez_compressed(
             cache_path,
             patches=patches_array,
             year=self.year,
-            patch_size=self.patch_size
+            patch_size=self.patch_size,
+            coords_hash=coords_hash
         )
 
         # Report cache size
