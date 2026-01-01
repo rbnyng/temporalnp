@@ -952,11 +952,11 @@ def main():
             print(f"    Coverage 3σ:  {test_metrics.get('coverage_3sigma', 0):.1f}% (ideal: 99.7%)")
 
     # Generate predictions with shot-level mapping for stratified analysis
+    # Use test_df itself as context (same tile, same year - like standard evaluation)
     print("\n  Generating shot-level predictions for stratified analysis...")
     from utils.normalization import denormalize_agbd
-    train_context_df = pd.concat([train_df, val_df], ignore_index=False)
     test_preds_log, test_unc_log = predict_on_test_df(
-        model, test_df, train_context_df,
+        model, test_df, test_df,  # Use test_df as context (same-tile, same-year context)
         global_bounds, temporal_bounds, args.device,
         max_context_shots=args.max_context_shots
     )
