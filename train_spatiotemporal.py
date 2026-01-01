@@ -493,7 +493,7 @@ def predict_on_test_df(
     """
     model.eval()
 
-    from utils.normalization import normalize_coords, normalize_agbd
+    from utils.normalization import normalize_agbd
 
     # Group test points by tile
     test_tiles = test_df['tile_id'].unique()
@@ -538,10 +538,9 @@ def predict_on_test_df(
             ctx_coords_norm[:, 0] = (ctx_coords[:, 0] - lon_min) / (lon_max - lon_min + 1e-8)
             ctx_coords_norm[:, 1] = (ctx_coords[:, 1] - lat_min) / (lat_max - lat_min + 1e-8)
 
-            # Compute temporal encoding for context
-            ctx_spatiotemporal = compute_temporal_encoding(
-                ctx_coords_norm, ctx_time, temporal_bounds
-            )
+            # Compute temporal encoding for context and concatenate with spatial coords
+            ctx_temporal = compute_temporal_encoding(ctx_time, temporal_bounds)
+            ctx_spatiotemporal = np.concatenate([ctx_coords_norm, ctx_temporal], axis=1)
 
             ctx_agbd_norm = normalize_agbd(ctx_agbd)
 
@@ -554,9 +553,9 @@ def predict_on_test_df(
             tgt_coords_norm[:, 0] = (tgt_coords[:, 0] - lon_min) / (lon_max - lon_min + 1e-8)
             tgt_coords_norm[:, 1] = (tgt_coords[:, 1] - lat_min) / (lat_max - lat_min + 1e-8)
 
-            tgt_spatiotemporal = compute_temporal_encoding(
-                tgt_coords_norm, tgt_time, temporal_bounds
-            )
+            # Compute temporal encoding for targets and concatenate
+            tgt_temporal = compute_temporal_encoding(tgt_time, temporal_bounds)
+            tgt_spatiotemporal = np.concatenate([tgt_coords_norm, tgt_temporal], axis=1)
 
             # To tensors
             ctx_coords_t = torch.from_numpy(ctx_spatiotemporal).float().to(device)
