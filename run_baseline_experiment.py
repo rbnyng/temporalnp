@@ -1,9 +1,9 @@
 """
-Run temporal interpolation baseline experiment with multiple seeds.
+Run temporal baseline experiment with multiple seeds.
 
-This script runs the baseline experiment:
-1. Trains spatial-only models on pre-event and post-event data
-2. Tests using temporal linear interpolation on the event year
+This script runs baseline experiments for comparison with the spatiotemporal model:
+1. Supports multiple baseline modes (interpolation, pre_only, post_only, mean)
+2. Uses tile-based context selection (same as main model)
 3. Runs multiple seeds for statistical robustness
 
 Usage:
@@ -12,6 +12,7 @@ Usage:
         --pre_years 2019 2020 \
         --post_years 2022 2023 \
         --test_year 2021 \
+        --mode interpolation \
         --n_seeds 10 \
         --output_dir ./results/mcfarland_baseline
 """
@@ -30,7 +31,13 @@ PROJECT_ROOT = Path(__file__).parent.resolve()
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Run Temporal Interpolation Baseline Experiment')
+    parser = argparse.ArgumentParser(description='Run Temporal Baseline Experiment')
+
+    # Baseline mode
+    parser.add_argument('--mode', type=str, default='interpolation',
+                        choices=['interpolation', 'pre_only', 'post_only', 'mean'],
+                        help='Baseline mode: interpolation (linear blend), pre_only (historical), '
+                             'post_only (oracle), mean (simple average)')
 
     # Region and temporal arguments
     parser.add_argument('--region_bbox', type=float, nargs=4, required=True,
@@ -59,12 +66,10 @@ def parse_args():
                         help='Batch size')
     parser.add_argument('--lr', type=float, default=5e-4,
                         help='Learning rate')
-    parser.add_argument('--n_context', type=int, default=100,
-                        help='Number of nearest context points for prediction')
     parser.add_argument('--max_context_shots', type=int, default=1024,
-                        help='Max context shots per tile during training')
+                        help='Max context shots per tile during training/inference')
     parser.add_argument('--max_target_shots', type=int, default=1024,
-                        help='Max target shots per tile during training')
+                        help='Max target shots per tile during training/inference')
 
     # Infrastructure
     parser.add_argument('--cache_dir', type=str, default='./cache',
@@ -81,6 +86,7 @@ def run_single_seed(seed: int, args, seed_output_dir: Path) -> dict:
     """Run baseline for a single seed."""
     cmd = [
         sys.executable, 'baselines/temporal_interpolation.py',
+        '--mode', args.mode,
         '--region_bbox', *[str(x) for x in args.region_bbox],
         '--pre_years', *[str(y) for y in args.pre_years],
         '--post_years', *[str(y) for y in args.post_years],
@@ -91,7 +97,6 @@ def run_single_seed(seed: int, args, seed_output_dir: Path) -> dict:
         '--epochs', str(args.epochs),
         '--batch_size', str(args.batch_size),
         '--lr', str(args.lr),
-        '--n_context', str(args.n_context),
         '--max_context_shots', str(args.max_context_shots),
         '--max_target_shots', str(args.max_target_shots),
         '--cache_dir', args.cache_dir,
@@ -238,9 +243,17 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    mode_names = {
+        'interpolation': 'Temporal Linear Interpolation',
+        'pre_only': 'Pre-Event Only (Historical)',
+        'post_only': 'Post-Event Only (Oracle)',
+        'mean': 'Mean of Pre/Post'
+    }
+
     # Save experiment config
     experiment_config = {
-        'method': 'temporal_linear_interpolation',
+        'method': args.mode,
+        'method_name': mode_names[args.mode],
         'region_bbox': args.region_bbox,
         'pre_years': args.pre_years,
         'post_years': args.post_years,
@@ -251,7 +264,8 @@ def main():
         'epochs': args.epochs,
         'batch_size': args.batch_size,
         'lr': args.lr,
-        'n_context': args.n_context,
+        'max_context_shots': args.max_context_shots,
+        'context_selection': 'tile_based',
         'started_at': datetime.now().isoformat()
     }
 
@@ -259,8 +273,9 @@ def main():
         json.dump(experiment_config, f, indent=2)
 
     print("=" * 80)
-    print("Temporal Interpolation Baseline Experiment")
+    print(f"Baseline Experiment: {mode_names[args.mode]}")
     print("=" * 80)
+    print(f"Mode: {args.mode}")
     print(f"Region: {args.region_bbox}")
     print(f"Pre-event years: {args.pre_years}")
     print(f"Post-event years: {args.post_years}")
