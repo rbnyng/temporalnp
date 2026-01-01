@@ -358,8 +358,10 @@ def compute_disturbance_analysis(
     - per_tile: DataFrame with tile-level metrics
     - correlation: Pearson correlation between disturbance and abs error
     - summary: Aggregate statistics
+    - stratified_r2: R² computed separately for stable vs fire tiles
     """
     from scipy import stats
+    from sklearn.metrics import r2_score
 
     # Get test tiles
     test_tiles = test_df['tile_id'].unique()
@@ -438,6 +440,11 @@ def compute_disturbance_analysis(
     else:
         quartile_rmse = {}
 
+    # Compute stratified R² by disturbance level
+    # Stable tiles: disturbance < 0.2 (less than 20% biomass change)
+    # Fire tiles: disturbance > 0.5 (more than 50% biomass loss)
+    stratified_r2 = _compute_stratified_r2(test_df, predictions, tile_df)
+
     return {
         'per_tile': tile_df.to_dict('records'),
         'correlation': {
@@ -445,6 +452,7 @@ def compute_disturbance_analysis(
             'p_value': float(p_value) if not np.isnan(p_value) else None
         },
         'quartile_rmse': {k: float(v) for k, v in quartile_rmse.items()},
+        'stratified_r2': stratified_r2,
         'summary': {
             'mean_disturbance': float(tile_df['disturbance'].mean()),
             'std_disturbance': float(tile_df['disturbance'].std()),
@@ -454,6 +462,101 @@ def compute_disturbance_analysis(
             'mean_change_from_pre': float(tile_df['change_from_pre'].mean())
         }
     }
+
+
+def _compute_stratified_r2(
+    test_df: pd.DataFrame,
+    predictions: np.ndarray,
+    tile_df: pd.DataFrame
+) -> dict:
+    """
+    Compute R² separately for stable forest vs fire-affected tiles.
+
+    Stratification:
+    - Stable tiles: disturbance < 0.2 (less than 20% biomass change)
+    - Fire tiles: disturbance > 0.5 (more than 50% biomass loss)
+
+    This helps reveal that baselines fail on disturbance while the
+    spatiotemporal model maintains performance on fire-affected areas.
+    """
+    from sklearn.metrics import r2_score
+
+    # Create tile_id -> disturbance mapping
+    tile_disturbance = dict(zip(tile_df['tile_id'], tile_df['disturbance']))
+
+    # Add disturbance to test_df
+    test_disturbance = test_df['tile_id'].map(tile_disturbance)
+
+    # Stable tiles: disturbance < 0.2
+    stable_mask = (test_disturbance < 0.2) & (~test_disturbance.isna())
+    stable_mask = stable_mask.values
+
+    # Fire tiles: disturbance > 0.5 (50% biomass loss)
+    fire_mask = (test_disturbance > 0.5) & (~test_disturbance.isna())
+    fire_mask = fire_mask.values
+
+    # Also compute for moderate disturbance (0.2 <= dist <= 0.5)
+    moderate_mask = (test_disturbance >= 0.2) & (test_disturbance <= 0.5) & (~test_disturbance.isna())
+    moderate_mask = moderate_mask.values
+
+    results = {
+        'stable': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
+        'fire': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
+        'moderate': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0}
+    }
+
+    targets = test_df['agbd'].values
+
+    # Stable tiles
+    if stable_mask.sum() >= 10:  # Need enough samples for meaningful R²
+        stable_preds = predictions[stable_mask]
+        stable_targets = targets[stable_mask]
+        # Filter out NaN predictions
+        valid = ~np.isnan(stable_preds)
+        if valid.sum() >= 10:
+            r2 = r2_score(stable_targets[valid], stable_preds[valid])
+            rmse = np.sqrt(np.mean((stable_preds[valid] - stable_targets[valid]) ** 2))
+            n_stable_tiles = test_df.loc[stable_mask, 'tile_id'].nunique()
+            results['stable'] = {
+                'r2': float(r2),
+                'rmse': float(rmse),
+                'n_shots': int(valid.sum()),
+                'n_tiles': int(n_stable_tiles)
+            }
+
+    # Fire tiles
+    if fire_mask.sum() >= 10:
+        fire_preds = predictions[fire_mask]
+        fire_targets = targets[fire_mask]
+        valid = ~np.isnan(fire_preds)
+        if valid.sum() >= 10:
+            r2 = r2_score(fire_targets[valid], fire_preds[valid])
+            rmse = np.sqrt(np.mean((fire_preds[valid] - fire_targets[valid]) ** 2))
+            n_fire_tiles = test_df.loc[fire_mask, 'tile_id'].nunique()
+            results['fire'] = {
+                'r2': float(r2),
+                'rmse': float(rmse),
+                'n_shots': int(valid.sum()),
+                'n_tiles': int(n_fire_tiles)
+            }
+
+    # Moderate disturbance tiles
+    if moderate_mask.sum() >= 10:
+        mod_preds = predictions[moderate_mask]
+        mod_targets = targets[moderate_mask]
+        valid = ~np.isnan(mod_preds)
+        if valid.sum() >= 10:
+            r2 = r2_score(mod_targets[valid], mod_preds[valid])
+            rmse = np.sqrt(np.mean((mod_preds[valid] - mod_targets[valid]) ** 2))
+            n_mod_tiles = test_df.loc[moderate_mask, 'tile_id'].nunique()
+            results['moderate'] = {
+                'r2': float(r2),
+                'rmse': float(rmse),
+                'n_shots': int(valid.sum()),
+                'n_tiles': int(n_mod_tiles)
+            }
+
+    return results
 
 
 def temporal_interpolation(
@@ -712,6 +815,25 @@ def main():
         for q, rmse_val in disturbance_analysis['quartile_rmse'].items():
             print(f"    {q}: {rmse_val:.2f} Mg/ha")
 
+    # Print stratified R² (key insight: baseline fails on fire tiles)
+    strat = disturbance_analysis['stratified_r2']
+    print(f"\nStratified R² by Disturbance Level:")
+    if strat['stable']['r2'] is not None:
+        print(f"  Stable tiles (<20% change):  R²={strat['stable']['r2']:.4f}, "
+              f"RMSE={strat['stable']['rmse']:.2f} Mg/ha ({strat['stable']['n_shots']} shots, {strat['stable']['n_tiles']} tiles)")
+    else:
+        print(f"  Stable tiles (<20% change):  Not enough data")
+    if strat['moderate']['r2'] is not None:
+        print(f"  Moderate (20-50% change):    R²={strat['moderate']['r2']:.4f}, "
+              f"RMSE={strat['moderate']['rmse']:.2f} Mg/ha ({strat['moderate']['n_shots']} shots, {strat['moderate']['n_tiles']} tiles)")
+    else:
+        print(f"  Moderate (20-50% change):    Not enough data")
+    if strat['fire']['r2'] is not None:
+        print(f"  Fire tiles (>50% loss):      R²={strat['fire']['r2']:.4f}, "
+              f"RMSE={strat['fire']['rmse']:.2f} Mg/ha ({strat['fire']['n_shots']} shots, {strat['fire']['n_tiles']} tiles)")
+    else:
+        print(f"  Fire tiles (>50% loss):      Not enough data")
+
     # Save results
     results = {
         'method': args.mode,
@@ -741,7 +863,8 @@ def main():
             'correlation': disturbance_analysis['correlation'],
             'quartile_rmse': disturbance_analysis['quartile_rmse'],
             'summary': disturbance_analysis['summary']
-        }
+        },
+        'stratified_r2': disturbance_analysis['stratified_r2']
     }
 
     with open(output_dir / 'results.json', 'w') as f:
