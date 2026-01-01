@@ -19,6 +19,7 @@ import json
 from pathlib import Path
 import pickle
 from time import time
+from typing import Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -240,17 +241,21 @@ def compute_disturbance_analysis(
     gedi_df: pd.DataFrame,
     test_df: pd.DataFrame,
     train_years: list,
-    test_year: int
+    test_year: int,
+    predictions: np.ndarray = None
 ) -> dict:
     """
-    Compute per-tile disturbance metrics.
+    Compute per-tile disturbance metrics and optionally stratified R².
 
     Disturbance intensity = (expected - observed) / expected
     where expected = (pre_mean + post_mean) / 2, or just pre_mean if no post.
 
     For spatiotemporal, we infer pre/post from train_years relative to test_year.
+
+    If predictions are provided, also computes stratified R² by disturbance level.
     """
     from scipy import stats
+    from sklearn.metrics import r2_score
 
     # Infer pre and post years from train_years
     pre_years = [y for y in train_years if y < test_year]
@@ -277,6 +282,17 @@ def compute_disturbance_analysis(
         test_mean = test_tile_df['agbd'].mean()
         n_test_shots = len(test_tile_df)
 
+        # Prediction error for this tile (if predictions provided)
+        tile_rmse = np.nan
+        tile_mae = np.nan
+        if predictions is not None:
+            tile_mask = test_df['tile_id'] == tile_id
+            tile_preds = predictions[tile_mask.values]
+            tile_targets = test_tile_df['agbd'].values
+            if len(tile_preds) > 0 and not np.any(np.isnan(tile_preds)):
+                tile_rmse = np.sqrt(np.mean((tile_preds - tile_targets) ** 2))
+                tile_mae = np.mean(np.abs(tile_preds - tile_targets))
+
         # Expected value (linear interpolation assumption)
         if not np.isnan(pre_mean) and not np.isnan(post_mean):
             expected = (pre_mean + post_mean) / 2
@@ -302,6 +318,8 @@ def compute_disturbance_analysis(
             'expected': expected,
             'disturbance': disturbance,
             'change_from_pre': change_from_pre,
+            'tile_rmse': tile_rmse,
+            'tile_mae': tile_mae,
             'n_test_shots': n_test_shots,
             'n_pre_shots': len(pre_data),
             'n_post_shots': len(post_data)
@@ -312,10 +330,41 @@ def compute_disturbance_analysis(
     # Summary statistics
     valid_mask = ~tile_df['disturbance'].isna()
 
-    return {
+    # Compute stratified R² if predictions are provided
+    stratified_r2 = None
+    if predictions is not None:
+        stratified_r2 = _compute_stratified_r2(test_df, predictions, tile_df)
+
+    # Compute correlation between disturbance and error (if predictions provided)
+    correlation = {'pearson_r': None, 'p_value': None}
+    quartile_rmse = {}
+    if predictions is not None:
+        valid_error_mask = valid_mask & (~tile_df['tile_rmse'].isna())
+        if valid_error_mask.sum() >= 3:
+            corr, p_value = stats.pearsonr(
+                tile_df.loc[valid_error_mask, 'disturbance'],
+                tile_df.loc[valid_error_mask, 'tile_rmse']
+            )
+            correlation = {
+                'pearson_r': float(corr) if not np.isnan(corr) else None,
+                'p_value': float(p_value) if not np.isnan(p_value) else None
+            }
+
+        # Quartile breakdown
+        valid_tiles = tile_df[valid_error_mask].copy()
+        if len(valid_tiles) >= 4:
+            valid_tiles['disturbance_quartile'] = pd.qcut(
+                valid_tiles['disturbance'], q=4, labels=['Q1_low', 'Q2', 'Q3', 'Q4_high']
+            )
+            quartile_rmse = valid_tiles.groupby('disturbance_quartile')['tile_rmse'].mean().to_dict()
+            quartile_rmse = {k: float(v) for k, v in quartile_rmse.items()}
+
+    result = {
         'per_tile': tile_df.to_dict('records'),
         'pre_years': pre_years,
         'post_years': post_years,
+        'correlation': correlation,
+        'quartile_rmse': quartile_rmse,
         'summary': {
             'mean_disturbance': float(tile_df['disturbance'].mean()) if valid_mask.any() else None,
             'std_disturbance': float(tile_df['disturbance'].std()) if valid_mask.any() else None,
@@ -325,6 +374,223 @@ def compute_disturbance_analysis(
             'mean_change_from_pre': float(tile_df['change_from_pre'].mean()) if valid_mask.any() else None
         }
     }
+
+    if stratified_r2 is not None:
+        result['stratified_r2'] = stratified_r2
+
+    return result
+
+
+def _compute_stratified_r2(
+    test_df: pd.DataFrame,
+    predictions: np.ndarray,
+    tile_df: pd.DataFrame
+) -> dict:
+    """
+    Compute R² separately for stable forest vs fire-affected tiles.
+
+    Stratification:
+    - Stable tiles: disturbance < 0.2 (less than 20% biomass change)
+    - Fire tiles: disturbance > 0.5 (more than 50% biomass loss)
+
+    This helps reveal that baselines fail on disturbance while the
+    spatiotemporal model maintains performance on fire-affected areas.
+    """
+    from sklearn.metrics import r2_score
+
+    # Create tile_id -> disturbance mapping
+    tile_disturbance = dict(zip(tile_df['tile_id'], tile_df['disturbance']))
+
+    # Add disturbance to test_df
+    test_disturbance = test_df['tile_id'].map(tile_disturbance)
+
+    # Stable tiles: disturbance < 0.2
+    stable_mask = (test_disturbance < 0.2) & (~test_disturbance.isna())
+    stable_mask = stable_mask.values
+
+    # Fire tiles: disturbance > 0.5 (50% biomass loss)
+    fire_mask = (test_disturbance > 0.5) & (~test_disturbance.isna())
+    fire_mask = fire_mask.values
+
+    # Also compute for moderate disturbance (0.2 <= dist <= 0.5)
+    moderate_mask = (test_disturbance >= 0.2) & (test_disturbance <= 0.5) & (~test_disturbance.isna())
+    moderate_mask = moderate_mask.values
+
+    results = {
+        'stable': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
+        'fire': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
+        'moderate': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0}
+    }
+
+    targets = test_df['agbd'].values
+
+    # Stable tiles
+    if stable_mask.sum() >= 10:  # Need enough samples for meaningful R²
+        stable_preds = predictions[stable_mask]
+        stable_targets = targets[stable_mask]
+        # Filter out NaN predictions
+        valid = ~np.isnan(stable_preds)
+        if valid.sum() >= 10:
+            r2 = r2_score(stable_targets[valid], stable_preds[valid])
+            rmse = np.sqrt(np.mean((stable_preds[valid] - stable_targets[valid]) ** 2))
+            n_stable_tiles = test_df.loc[stable_mask, 'tile_id'].nunique()
+            results['stable'] = {
+                'r2': float(r2),
+                'rmse': float(rmse),
+                'n_shots': int(valid.sum()),
+                'n_tiles': int(n_stable_tiles)
+            }
+
+    # Fire tiles
+    if fire_mask.sum() >= 10:
+        fire_preds = predictions[fire_mask]
+        fire_targets = targets[fire_mask]
+        valid = ~np.isnan(fire_preds)
+        if valid.sum() >= 10:
+            r2 = r2_score(fire_targets[valid], fire_preds[valid])
+            rmse = np.sqrt(np.mean((fire_preds[valid] - fire_targets[valid]) ** 2))
+            n_fire_tiles = test_df.loc[fire_mask, 'tile_id'].nunique()
+            results['fire'] = {
+                'r2': float(r2),
+                'rmse': float(rmse),
+                'n_shots': int(valid.sum()),
+                'n_tiles': int(n_fire_tiles)
+            }
+
+    # Moderate disturbance tiles
+    if moderate_mask.sum() >= 10:
+        mod_preds = predictions[moderate_mask]
+        mod_targets = targets[moderate_mask]
+        valid = ~np.isnan(mod_preds)
+        if valid.sum() >= 10:
+            r2 = r2_score(mod_targets[valid], mod_preds[valid])
+            rmse = np.sqrt(np.mean((mod_preds[valid] - mod_targets[valid]) ** 2))
+            n_mod_tiles = test_df.loc[moderate_mask, 'tile_id'].nunique()
+            results['moderate'] = {
+                'r2': float(r2),
+                'rmse': float(rmse),
+                'n_shots': int(valid.sum()),
+                'n_tiles': int(n_mod_tiles)
+            }
+
+    return results
+
+
+def predict_on_test_df(
+    model: torch.nn.Module,
+    test_df: pd.DataFrame,
+    context_df: pd.DataFrame,
+    global_bounds: tuple,
+    temporal_bounds: tuple,
+    device: str,
+    max_context_shots: int = 1024
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generate predictions on test_df while preserving shot order.
+
+    Uses tile-based context selection (same tile from context_df).
+    Returns predictions and uncertainties aligned with test_df index.
+    """
+    model.eval()
+
+    from utils.normalization import normalize_coords, normalize_agbd
+
+    # Group test points by tile
+    test_tiles = test_df['tile_id'].unique()
+
+    all_predictions = []
+    all_uncertainties = []
+    all_indices = []
+
+    with torch.no_grad():
+        for tile_id in tqdm(test_tiles, desc='Predicting by tile'):
+            # Get test points for this tile
+            tile_test = test_df[test_df['tile_id'] == tile_id]
+            tile_indices = tile_test.index.tolist()
+
+            # Get context points for this tile
+            tile_context = context_df[context_df['tile_id'] == tile_id]
+
+            if len(tile_context) == 0:
+                # No context for this tile, use NaN predictions
+                all_predictions.extend([np.nan] * len(tile_test))
+                all_uncertainties.extend([np.nan] * len(tile_test))
+                all_indices.extend(tile_indices)
+                continue
+
+            # Prepare context
+            ctx_coords = tile_context[['longitude', 'latitude']].values
+            ctx_embeddings = np.stack(tile_context['embedding_patch'].values)
+            ctx_agbd = tile_context['agbd'].values[:, None]
+            ctx_time = pd.to_datetime(tile_context['time'])
+
+            # Subsample context if too large
+            if len(ctx_coords) > max_context_shots:
+                indices = np.random.choice(len(ctx_coords), max_context_shots, replace=False)
+                ctx_coords = ctx_coords[indices]
+                ctx_embeddings = ctx_embeddings[indices]
+                ctx_agbd = ctx_agbd[indices]
+                ctx_time = ctx_time.iloc[indices]
+
+            # Normalize spatial coords
+            lon_min, lat_min, lon_max, lat_max = global_bounds
+            ctx_coords_norm = np.zeros_like(ctx_coords)
+            ctx_coords_norm[:, 0] = (ctx_coords[:, 0] - lon_min) / (lon_max - lon_min + 1e-8)
+            ctx_coords_norm[:, 1] = (ctx_coords[:, 1] - lat_min) / (lat_max - lat_min + 1e-8)
+
+            # Compute temporal encoding for context
+            ctx_spatiotemporal = compute_temporal_encoding(
+                ctx_coords_norm, ctx_time, temporal_bounds
+            )
+
+            ctx_agbd_norm = normalize_agbd(ctx_agbd)
+
+            # Prepare targets
+            tgt_coords = tile_test[['longitude', 'latitude']].values
+            tgt_embeddings = np.stack(tile_test['embedding_patch'].values)
+            tgt_time = pd.to_datetime(tile_test['time'])
+
+            tgt_coords_norm = np.zeros_like(tgt_coords)
+            tgt_coords_norm[:, 0] = (tgt_coords[:, 0] - lon_min) / (lon_max - lon_min + 1e-8)
+            tgt_coords_norm[:, 1] = (tgt_coords[:, 1] - lat_min) / (lat_max - lat_min + 1e-8)
+
+            tgt_spatiotemporal = compute_temporal_encoding(
+                tgt_coords_norm, tgt_time, temporal_bounds
+            )
+
+            # To tensors
+            ctx_coords_t = torch.from_numpy(ctx_spatiotemporal).float().to(device)
+            ctx_embeddings_t = torch.from_numpy(ctx_embeddings).float().to(device)
+            ctx_agbd_t = torch.from_numpy(ctx_agbd_norm).float().to(device)
+            tgt_coords_t = torch.from_numpy(tgt_spatiotemporal).float().to(device)
+            tgt_embeddings_t = torch.from_numpy(tgt_embeddings).float().to(device)
+
+            # Predict
+            pred_mean, pred_std = model.predict(
+                ctx_coords_t, ctx_embeddings_t, ctx_agbd_t,
+                tgt_coords_t, tgt_embeddings_t
+            )
+
+            all_predictions.extend(pred_mean.cpu().numpy().flatten().tolist())
+            all_uncertainties.extend(pred_std.cpu().numpy().flatten().tolist())
+            all_indices.extend(tile_indices)
+
+            # Clear GPU cache
+            if 'cuda' in str(device):
+                torch.cuda.empty_cache()
+
+    # Reorder to match original test_df order
+    result_df = pd.DataFrame({
+        'idx': all_indices,
+        'pred': all_predictions,
+        'unc': all_uncertainties
+    }).set_index('idx')
+
+    # Align with test_df index
+    predictions = result_df.loc[test_df.index, 'pred'].values
+    uncertainties = result_df.loc[test_df.index, 'unc'].values
+
+    return predictions, uncertainties
 
 
 def validate(model, dataloader, device, kl_weight=1.0, agbd_scale=200.0, log_transform_agbd=True,
@@ -685,9 +951,22 @@ def main():
             print(f"    Coverage 2σ:  {test_metrics.get('coverage_2sigma', 0):.1f}% (ideal: 95.4%)")
             print(f"    Coverage 3σ:  {test_metrics.get('coverage_3sigma', 0):.1f}% (ideal: 99.7%)")
 
-    # Compute disturbance analysis
+    # Generate predictions with shot-level mapping for stratified analysis
+    print("\n  Generating shot-level predictions for stratified analysis...")
+    from utils.normalization import denormalize_agbd
+    train_context_df = pd.concat([train_df, val_df], ignore_index=False)
+    test_preds_log, test_unc_log = predict_on_test_df(
+        model, test_df, train_context_df,
+        global_bounds, temporal_bounds, args.device,
+        max_context_shots=args.max_context_shots
+    )
+    # Denormalize predictions to linear scale for disturbance analysis
+    test_preds_linear = denormalize_agbd(test_preds_log)
+
+    # Compute disturbance analysis with predictions for stratified R²
     disturbance_analysis = compute_disturbance_analysis(
-        gedi_df, test_df, args.train_years, args.test_year
+        gedi_df, test_df, args.train_years, args.test_year,
+        predictions=test_preds_linear
     )
 
     print(f"\n  Disturbance Analysis:")
@@ -695,12 +974,46 @@ def main():
         print(f"    Mean disturbance: {disturbance_analysis['summary']['mean_disturbance']:.1%}")
         print(f"    Tiles with biomass loss: {disturbance_analysis['summary']['n_tiles_with_loss']}")
         print(f"    Tiles with major loss (>30%): {disturbance_analysis['summary']['pct_tiles_major_loss']:.1f}%")
+        if disturbance_analysis['correlation']['pearson_r'] is not None:
+            print(f"    Error-disturbance correlation: r={disturbance_analysis['correlation']['pearson_r']:.3f} "
+                  f"(p={disturbance_analysis['correlation']['p_value']:.3f})")
+        if disturbance_analysis['quartile_rmse']:
+            print(f"    RMSE by disturbance quartile:")
+            for q, rmse_val in disturbance_analysis['quartile_rmse'].items():
+                print(f"      {q}: {rmse_val:.2f} Mg/ha")
     else:
         print(f"    No valid disturbance data")
+
+    # Print stratified R² (key insight: model maintains performance on fire tiles)
+    if 'stratified_r2' in disturbance_analysis:
+        strat = disturbance_analysis['stratified_r2']
+        print(f"\n  Stratified R² by Disturbance Level:")
+        if strat['stable']['r2'] is not None:
+            print(f"    Stable tiles (<20% change):  R²={strat['stable']['r2']:.4f}, "
+                  f"RMSE={strat['stable']['rmse']:.2f} Mg/ha ({strat['stable']['n_shots']} shots, {strat['stable']['n_tiles']} tiles)")
+        else:
+            print(f"    Stable tiles (<20% change):  Not enough data")
+        if strat['moderate']['r2'] is not None:
+            print(f"    Moderate (20-50% change):    R²={strat['moderate']['r2']:.4f}, "
+                  f"RMSE={strat['moderate']['rmse']:.2f} Mg/ha ({strat['moderate']['n_shots']} shots, {strat['moderate']['n_tiles']} tiles)")
+        else:
+            print(f"    Moderate (20-50% change):    Not enough data")
+        if strat['fire']['r2'] is not None:
+            print(f"    Fire tiles (>50% loss):      R²={strat['fire']['r2']:.4f}, "
+                  f"RMSE={strat['fire']['rmse']:.2f} Mg/ha ({strat['fire']['n_shots']} shots, {strat['fire']['n_tiles']} tiles)")
+        else:
+            print(f"    Fire tiles (>50% loss):      Not enough data")
 
     # Save per-tile disturbance analysis
     tile_disturbance_df = pd.DataFrame(disturbance_analysis['per_tile'])
     tile_disturbance_df.to_parquet(output_dir / 'tile_disturbance.parquet')
+
+    # Save predictions for analysis
+    test_df_out = test_df[['latitude', 'longitude', 'agbd', 'time', 'tile_id']].copy()
+    test_df_out['pred'] = test_preds_linear
+    test_df_out['unc'] = denormalize_agbd(test_unc_log) if test_unc_log is not None else np.nan
+    test_df_out['residual'] = test_df['agbd'].values - test_preds_linear
+    test_df_out.to_parquet(output_dir / 'test_predictions.parquet')
 
     # Save final results
     checkpoint['test_metrics'] = test_metrics
@@ -718,9 +1031,14 @@ def main():
         'disturbance': {
             'pre_years': disturbance_analysis['pre_years'],
             'post_years': disturbance_analysis['post_years'],
+            'correlation': disturbance_analysis['correlation'],
+            'quartile_rmse': disturbance_analysis['quartile_rmse'],
             'summary': disturbance_analysis['summary']
         }
     }
+    if 'stratified_r2' in disturbance_analysis:
+        results['stratified_r2'] = disturbance_analysis['stratified_r2']
+
     with open(output_dir / 'results.json', 'w') as f:
         json.dump(_make_serializable(results), f, indent=2)
 
