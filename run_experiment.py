@@ -24,6 +24,8 @@ from pathlib import Path
 from datetime import datetime
 import numpy as np
 
+from utils.disturbance import aggregate_stratified_r2, print_aggregated_stratified_r2
+
 # Get project root directory for PYTHONPATH
 PROJECT_ROOT = Path(__file__).parent.resolve()
 
@@ -150,19 +152,8 @@ def aggregate_results(all_results: list) -> dict:
     error_disturbance_corr = [r['disturbance']['correlation']['pearson_r']
                                for r in successful if r.get('disturbance') and r['disturbance'].get('correlation') and r['disturbance']['correlation'].get('pearson_r') is not None]
 
-    # Extract stratified R² metrics
-    stable_r2 = [r['stratified_r2']['stable']['r2']
-                 for r in successful if r.get('stratified_r2') and r['stratified_r2'].get('stable') and r['stratified_r2']['stable'].get('r2') is not None]
-    stable_rmse = [r['stratified_r2']['stable']['rmse']
-                   for r in successful if r.get('stratified_r2') and r['stratified_r2'].get('stable') and r['stratified_r2']['stable'].get('rmse') is not None]
-    fire_r2 = [r['stratified_r2']['fire']['r2']
-               for r in successful if r.get('stratified_r2') and r['stratified_r2'].get('fire') and r['stratified_r2']['fire'].get('r2') is not None]
-    fire_rmse = [r['stratified_r2']['fire']['rmse']
-                 for r in successful if r.get('stratified_r2') and r['stratified_r2'].get('fire') and r['stratified_r2']['fire'].get('rmse') is not None]
-    moderate_r2 = [r['stratified_r2']['moderate']['r2']
-                   for r in successful if r.get('stratified_r2') and r['stratified_r2'].get('moderate') and r['stratified_r2']['moderate'].get('r2') is not None]
-    moderate_rmse = [r['stratified_r2']['moderate']['rmse']
-                     for r in successful if r.get('stratified_r2') and r['stratified_r2'].get('moderate') and r['stratified_r2']['moderate'].get('rmse') is not None]
+    # Use shared utility for stratified R² aggregation
+    stratified_r2_agg = aggregate_stratified_r2(successful)
 
     aggregated = {
         'n_seeds': len(all_results),
@@ -222,32 +213,7 @@ def aggregate_results(all_results: list) -> dict:
                 'values': error_disturbance_corr
             }
         },
-        'stratified_r2': {
-            'stable': {
-                'r2_mean': float(np.mean(stable_r2)) if stable_r2 else None,
-                'r2_std': float(np.std(stable_r2)) if stable_r2 else None,
-                'rmse_mean': float(np.mean(stable_rmse)) if stable_rmse else None,
-                'rmse_std': float(np.std(stable_rmse)) if stable_rmse else None,
-                'r2_values': stable_r2,
-                'rmse_values': stable_rmse
-            },
-            'moderate': {
-                'r2_mean': float(np.mean(moderate_r2)) if moderate_r2 else None,
-                'r2_std': float(np.std(moderate_r2)) if moderate_r2 else None,
-                'rmse_mean': float(np.mean(moderate_rmse)) if moderate_rmse else None,
-                'rmse_std': float(np.std(moderate_rmse)) if moderate_rmse else None,
-                'r2_values': moderate_r2,
-                'rmse_values': moderate_rmse
-            },
-            'fire': {
-                'r2_mean': float(np.mean(fire_r2)) if fire_r2 else None,
-                'r2_std': float(np.std(fire_r2)) if fire_r2 else None,
-                'rmse_mean': float(np.mean(fire_rmse)) if fire_rmse else None,
-                'rmse_std': float(np.std(fire_rmse)) if fire_rmse else None,
-                'r2_values': fire_r2,
-                'rmse_values': fire_rmse
-            }
-        }
+        'stratified_r2': stratified_r2_agg
     }
 
     return aggregated
@@ -341,19 +307,9 @@ def main():
         if aggregated['disturbance'].get('error_disturbance_correlation', {}).get('mean') is not None:
             print(f"  Error-disturbance correlation: r={aggregated['disturbance']['error_disturbance_correlation']['mean']:.3f} ± {aggregated['disturbance']['error_disturbance_correlation']['std']:.3f}")
 
-    # Print stratified R² (key insight: spatiotemporal model maintains performance on fire tiles)
+    # Print stratified R² using shared utility
     if aggregated.get('stratified_r2'):
-        print(f"\nStratified R² by Disturbance Level:")
-        strat = aggregated['stratified_r2']
-        if strat['stable'].get('r2_mean') is not None:
-            print(f"  Stable tiles (<20% change):  R²={strat['stable']['r2_mean']:.4f} ± {strat['stable']['r2_std']:.4f}, "
-                  f"RMSE={strat['stable']['rmse_mean']:.2f} ± {strat['stable']['rmse_std']:.2f}")
-        if strat['moderate'].get('r2_mean') is not None:
-            print(f"  Moderate (20-50% change):    R²={strat['moderate']['r2_mean']:.4f} ± {strat['moderate']['r2_std']:.4f}, "
-                  f"RMSE={strat['moderate']['rmse_mean']:.2f} ± {strat['moderate']['rmse_std']:.2f}")
-        if strat['fire'].get('r2_mean') is not None:
-            print(f"  Fire tiles (>50% loss):      R²={strat['fire']['r2_mean']:.4f} ± {strat['fire']['r2_std']:.4f}, "
-                  f"RMSE={strat['fire']['rmse_mean']:.2f} ± {strat['fire']['rmse_std']:.2f}")
+        print_aggregated_stratified_r2(aggregated['stratified_r2'])
 
     print(f"\nResults saved to: {output_dir}")
 
