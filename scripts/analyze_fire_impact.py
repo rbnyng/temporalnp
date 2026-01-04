@@ -32,6 +32,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from data.gedi import GEDIQuerier
+from utils.config import _make_serializable
 
 
 def parse_args():
@@ -451,7 +452,7 @@ def main():
     }
 
     with open(output_dir / 'fire_impact_analysis.json', 'w') as f:
-        json.dump(results, f, indent=2)
+        json.dump(_make_serializable(results), f, indent=2)
 
     # Save shot-level data
     inside_fire.to_parquet(output_dir / 'gedi_shots_inside_fire.parquet')
