@@ -54,6 +54,8 @@ def parse_args():
     # Region and temporal arguments
     parser.add_argument('--region_bbox', type=float, nargs=4, required=True,
                         help='Region bounding box: min_lon min_lat max_lon max_lat')
+    parser.add_argument('--fire_shapefile', type=str, default=None,
+                        help='Optional: Path to fire boundary shapefile (.shp) to filter GEDI shots')
     parser.add_argument('--train_years', type=int, nargs='+', required=True,
                         help='Years to use for training (e.g., 2019 2020 2022 2023)')
     parser.add_argument('--test_year', type=int, required=True,
@@ -148,6 +150,36 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+
+def filter_shots_by_shapefile(df: pd.DataFrame, shapefile_path: str) -> pd.DataFrame:
+    """Filter GEDI shots to those inside a shapefile boundary."""
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    # Load shapefile
+    gdf = gpd.read_file(shapefile_path)
+
+    # Ensure CRS is WGS84
+    if gdf.crs is None:
+        gdf = gdf.set_crs('EPSG:4326')
+    elif gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs('EPSG:4326')
+
+    # Create points from GEDI shots
+    points = gpd.GeoSeries(
+        [Point(lon, lat) for lon, lat in zip(df['longitude'], df['latitude'])],
+        crs='EPSG:4326'
+    )
+
+    # Check which points are within the geometry
+    geometry = gdf.union_all() if hasattr(gdf, 'union_all') else gdf.unary_union
+    within_mask = points.within(geometry)
+
+    filtered_df = df[within_mask.values].copy()
+    print(f"Filtered to {len(filtered_df)} shots inside fire perimeter (from {len(df)})")
+
+    return filtered_df
 
 
 def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
@@ -413,6 +445,14 @@ def main():
         max_agbd=500.0
     )
     print(f"Retrieved {len(gedi_df)} GEDI shots across {gedi_df['tile_id'].nunique()} tiles")
+
+    # Apply fire shapefile filter if specified
+    if args.fire_shapefile:
+        print(f"\nApplying fire perimeter filter from: {args.fire_shapefile}")
+        gedi_df = filter_shots_by_shapefile(gedi_df, args.fire_shapefile)
+        if len(gedi_df) == 0:
+            print("No GEDI shots inside fire perimeter. Exiting.")
+            return
 
     # Add year column
     gedi_df['year'] = pd.to_datetime(gedi_df['time']).dt.year
