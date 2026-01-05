@@ -390,6 +390,43 @@ def main():
         print(f"  p-value: {change_stats['statistical_test']['p_value']:.2e}")
         print(f"  Significant at α=0.05: {change_stats['statistical_test']['significant_at_0.05']}")
 
+    # Monthly breakdown for fire year (to see pre vs during/post fire within that year)
+    if len(fire_year_df) > 0:
+        print(f"\n" + "=" * 80)
+        print(f"MONTHLY BREAKDOWN FOR FIRE YEAR ({args.fire_year})")
+        print("=" * 80)
+        fire_year_df = fire_year_df.copy()
+        fire_year_df['month'] = pd.to_datetime(fire_year_df['time']).dt.month
+        fire_year_df['month_name'] = pd.to_datetime(fire_year_df['time']).dt.strftime('%b')
+
+        monthly_stats = fire_year_df.groupby(['month', 'month_name'])['agbd'].agg(['mean', 'std', 'count'])
+        monthly_stats = monthly_stats.reset_index().sort_values('month')
+
+        print(f"\nNote: Dixie Fire started July 14, 2021")
+        print(f"\n{'Month':<10} {'Mean AGBD':>12} {'Std':>10} {'N Shots':>10}")
+        print("-" * 45)
+        for _, row in monthly_stats.iterrows():
+            fire_marker = " <-- fire started" if row['month'] == 7 else ""
+            print(f"{row['month_name']:<10} {row['mean']:>10.1f} Mg/ha {row['std']:>8.1f} {int(row['count']):>10}{fire_marker}")
+
+        # Compare pre-fire months (Jan-Jun) vs fire/post-fire months (Jul-Dec)
+        pre_fire_months = fire_year_df[fire_year_df['month'] <= 6]
+        post_fire_months = fire_year_df[fire_year_df['month'] >= 7]
+
+        if len(pre_fire_months) > 0 and len(post_fire_months) > 0:
+            print(f"\nWithin-year comparison:")
+            print(f"  Jan-Jun (pre-fire):  {pre_fire_months['agbd'].mean():.1f} Mg/ha (n={len(pre_fire_months)})")
+            print(f"  Jul-Dec (fire/post): {post_fire_months['agbd'].mean():.1f} Mg/ha (n={len(post_fire_months)})")
+            within_year_change = post_fire_months['agbd'].mean() - pre_fire_months['agbd'].mean()
+            print(f"  Within-year change:  {within_year_change:.1f} Mg/ha")
+
+        change_stats['fire_year_monthly'] = {
+            'monthly': {row['month_name']: {'mean': float(row['mean']), 'std': float(row['std']), 'count': int(row['count'])}
+                        for _, row in monthly_stats.iterrows()},
+            'pre_fire_months_mean': float(pre_fire_months['agbd'].mean()) if len(pre_fire_months) > 0 else None,
+            'post_fire_months_mean': float(post_fire_months['agbd'].mean()) if len(post_fire_months) > 0 else None
+        }
+
     # Optional: Analyze by burn severity if dNBR provided
     if args.dnbr_raster and Path(args.dnbr_raster).exists():
         print("\n" + "=" * 80)
