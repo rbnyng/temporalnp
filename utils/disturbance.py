@@ -160,25 +160,34 @@ def compute_disturbance_analysis(
 def compute_stratified_r2(
     test_df: pd.DataFrame,
     predictions: np.ndarray,
-    tile_df: pd.DataFrame
+    tile_df: pd.DataFrame,
+    thresholds: dict = None
 ) -> dict:
     """
-    Compute R² separately for stable forest vs fire-affected tiles.
+    Compute R² separately for stable forest vs disturbed tiles.
 
-    Stratification:
-    - Stable tiles: disturbance < 0.2 (less than 20% biomass change)
-    - Moderate tiles: 0.2 <= disturbance <= 0.5
-    - Fire tiles: disturbance > 0.5 (more than 50% biomass loss)
+    Default stratification (based on empirical Dixie Fire observations):
+    - Stable tiles: disturbance < 0.1 (less than 10% biomass change)
+    - Moderate tiles: 0.1 <= disturbance <= 0.3
+    - Disturbed tiles: disturbance > 0.3 (more than 30% biomass loss)
 
     Args:
         test_df: Test DataFrame with tile_id and agbd columns
         predictions: Predictions aligned with test_df
         tile_df: DataFrame with tile_id and disturbance columns
+        thresholds: Optional dict with 'stable_max' and 'disturbed_min' keys
 
     Returns:
         Dictionary with r2, rmse, n_shots, n_tiles for each stratum
     """
     from sklearn.metrics import r2_score
+
+    # Default thresholds based on empirical fire observations
+    if thresholds is None:
+        thresholds = {'stable_max': 0.1, 'disturbed_min': 0.3}
+
+    stable_max = thresholds.get('stable_max', 0.1)
+    disturbed_min = thresholds.get('disturbed_min', 0.3)
 
     # Create tile_id -> disturbance mapping
     tile_disturbance = dict(zip(tile_df['tile_id'], tile_df['disturbance']))
@@ -187,14 +196,15 @@ def compute_stratified_r2(
     test_disturbance = test_df['tile_id'].map(tile_disturbance)
 
     # Define masks for each stratum
-    stable_mask = ((test_disturbance < 0.2) & (~test_disturbance.isna())).values
-    moderate_mask = ((test_disturbance >= 0.2) & (test_disturbance <= 0.5) & (~test_disturbance.isna())).values
-    fire_mask = ((test_disturbance > 0.5) & (~test_disturbance.isna())).values
+    stable_mask = ((test_disturbance < stable_max) & (~test_disturbance.isna())).values
+    moderate_mask = ((test_disturbance >= stable_max) & (test_disturbance <= disturbed_min) & (~test_disturbance.isna())).values
+    disturbed_mask = ((test_disturbance > disturbed_min) & (~test_disturbance.isna())).values
 
     results = {
         'stable': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
         'moderate': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
-        'fire': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0}
+        'disturbed': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
+        'thresholds': thresholds
     }
 
     targets = test_df['agbd'].values
@@ -225,9 +235,9 @@ def compute_stratified_r2(
     if moderate_result:
         results['moderate'] = moderate_result
 
-    fire_result = compute_stratum_metrics(fire_mask, 'fire')
-    if fire_result:
-        results['fire'] = fire_result
+    disturbed_result = compute_stratum_metrics(disturbed_mask, 'disturbed')
+    if disturbed_result:
+        results['disturbed'] = disturbed_result
 
     return results
 
@@ -257,33 +267,43 @@ def print_disturbance_analysis(disturbance_analysis: dict, indent: str = "  ") -
 
 def print_stratified_r2(stratified_r2: dict, indent: str = "  ") -> None:
     """Print stratified R² results in a consistent format."""
+    thresholds = stratified_r2.get('thresholds', {'stable_max': 0.1, 'disturbed_min': 0.3})
+    stable_max = int(thresholds['stable_max'] * 100)
+    disturbed_min = int(thresholds['disturbed_min'] * 100)
+
     print(f"\n{indent}Stratified R² by Disturbance Level:")
 
     if stratified_r2['stable']['r2'] is not None:
         s = stratified_r2['stable']
-        print(f"{indent}  Stable (<20% change):   R²={s['r2']:.4f}, "
+        print(f"{indent}  Stable (<{stable_max}% change):    R²={s['r2']:.4f}, "
               f"RMSE={s['rmse']:.2f} Mg/ha ({s['n_shots']} shots, {s['n_tiles']} tiles)")
     else:
-        print(f"{indent}  Stable (<20% change):   Not enough data")
+        print(f"{indent}  Stable (<{stable_max}% change):    Not enough data")
 
     if stratified_r2['moderate']['r2'] is not None:
         m = stratified_r2['moderate']
-        print(f"{indent}  Moderate (20-50%):      R²={m['r2']:.4f}, "
+        print(f"{indent}  Moderate ({stable_max}-{disturbed_min}%):      R²={m['r2']:.4f}, "
               f"RMSE={m['rmse']:.2f} Mg/ha ({m['n_shots']} shots, {m['n_tiles']} tiles)")
     else:
-        print(f"{indent}  Moderate (20-50%):      Not enough data")
+        print(f"{indent}  Moderate ({stable_max}-{disturbed_min}%):      Not enough data")
 
-    if stratified_r2['fire']['r2'] is not None:
-        f = stratified_r2['fire']
-        print(f"{indent}  Fire (>50% loss):       R²={f['r2']:.4f}, "
-              f"RMSE={f['rmse']:.2f} Mg/ha ({f['n_shots']} shots, {f['n_tiles']} tiles)")
+    # Support both 'disturbed' (new) and 'fire' (legacy) keys
+    disturbed_key = 'disturbed' if 'disturbed' in stratified_r2 else 'fire'
+    if stratified_r2.get(disturbed_key, {}).get('r2') is not None:
+        d = stratified_r2[disturbed_key]
+        print(f"{indent}  Disturbed (>{disturbed_min}% loss): R²={d['r2']:.4f}, "
+              f"RMSE={d['rmse']:.2f} Mg/ha ({d['n_shots']} shots, {d['n_tiles']} tiles)")
     else:
-        print(f"{indent}  Fire (>50% loss):       Not enough data")
+        print(f"{indent}  Disturbed (>{disturbed_min}% loss): Not enough data")
 
 
 def aggregate_stratified_r2(results_list: list) -> dict:
     """
     Aggregate stratified R² metrics across multiple experiment runs.
+
+    Note: This simple aggregation averages R² values across seeds, but each seed
+    may have different tiles in the test set. For more robust analysis, use
+    compute_pooled_stratified_r2() which pools predictions across all seeds.
 
     Args:
         results_list: List of result dictionaries, each with 'stratified_r2' key
@@ -291,18 +311,25 @@ def aggregate_stratified_r2(results_list: list) -> dict:
     Returns:
         Aggregated statistics with mean, std for each stratum
     """
-    strata = ['stable', 'moderate', 'fire']
+    # Support both 'disturbed' (new) and 'fire' (legacy) keys
+    strata = ['stable', 'moderate', 'disturbed']
     aggregated = {}
 
     for stratum in strata:
-        r2_values = [r['stratified_r2'][stratum]['r2']
-                     for r in results_list
-                     if r.get('stratified_r2') and r['stratified_r2'].get(stratum)
-                     and r['stratified_r2'][stratum].get('r2') is not None]
-        rmse_values = [r['stratified_r2'][stratum]['rmse']
-                       for r in results_list
-                       if r.get('stratified_r2') and r['stratified_r2'].get(stratum)
-                       and r['stratified_r2'][stratum].get('rmse') is not None]
+        # Try both new and legacy key names
+        keys_to_try = [stratum] if stratum != 'disturbed' else ['disturbed', 'fire']
+
+        r2_values = []
+        rmse_values = []
+        for r in results_list:
+            if not r.get('stratified_r2'):
+                continue
+            for key in keys_to_try:
+                if r['stratified_r2'].get(key) and r['stratified_r2'][key].get('r2') is not None:
+                    r2_values.append(r['stratified_r2'][key]['r2'])
+                    if r['stratified_r2'][key].get('rmse') is not None:
+                        rmse_values.append(r['stratified_r2'][key]['rmse'])
+                    break
 
         aggregated[stratum] = {
             'r2_mean': float(np.mean(r2_values)) if r2_values else None,
@@ -318,14 +345,151 @@ def aggregate_stratified_r2(results_list: list) -> dict:
 
 def print_aggregated_stratified_r2(aggregated: dict, indent: str = "") -> None:
     """Print aggregated stratified R² results."""
+    thresholds = aggregated.get('thresholds', {'stable_max': 0.1, 'disturbed_min': 0.3})
+    stable_max = int(thresholds.get('stable_max', 0.1) * 100)
+    disturbed_min = int(thresholds.get('disturbed_min', 0.3) * 100)
+
     print(f"\n{indent}Stratified R² by Disturbance Level:")
 
-    for stratum, label in [('stable', 'Stable (<20% change)'),
-                           ('moderate', 'Moderate (20-50%)'),
-                           ('fire', 'Fire (>50% loss)')]:
-        s = aggregated[stratum]
-        if s['r2_mean'] is not None:
-            print(f"{indent}  {label:22s} R²={s['r2_mean']:.4f} ± {s['r2_std']:.4f}, "
-                  f"RMSE={s['rmse_mean']:.2f} ± {s['rmse_std']:.2f}")
+    for stratum, label in [('stable', f'Stable (<{stable_max}% change)'),
+                           ('moderate', f'Moderate ({stable_max}-{disturbed_min}%)'),
+                           ('disturbed', f'Disturbed (>{disturbed_min}% loss)')]:
+        s = aggregated.get(stratum, {})
+        if s.get('r2_mean') is not None:
+            n_seeds = len(s.get('r2_values', []))
+            print(f"{indent}  {label:24s} R²={s['r2_mean']:.4f} ± {s['r2_std']:.4f}, "
+                  f"RMSE={s['rmse_mean']:.2f} ± {s['rmse_std']:.2f} (n={n_seeds} seeds)")
         else:
-            print(f"{indent}  {label:22s} Not enough data")
+            print(f"{indent}  {label:24s} Not enough data")
+
+
+def compute_pooled_stratified_r2(
+    output_dir,
+    gedi_df: pd.DataFrame,
+    pre_years: List[int],
+    post_years: List[int],
+    thresholds: dict = None
+) -> dict:
+    """
+    Compute stratified R² by pooling predictions across all seeds.
+
+    This is more robust than averaging R² values from different seeds because
+    each tile appears exactly once in the pooled predictions.
+
+    Args:
+        output_dir: Path to experiment output directory containing seed subdirs
+        gedi_df: Full GEDI DataFrame with all years (for computing disturbance)
+        pre_years: Years before the event
+        post_years: Years after the event
+        thresholds: Optional dict with 'stable_max' and 'disturbed_min' keys
+
+    Returns:
+        Dictionary with pooled stratified R² metrics
+    """
+    from pathlib import Path
+    from sklearn.metrics import r2_score
+
+    if thresholds is None:
+        thresholds = {'stable_max': 0.1, 'disturbed_min': 0.3}
+
+    output_dir = Path(output_dir)
+
+    # Collect predictions from all seeds
+    all_predictions = []
+
+    for seed_dir in sorted(output_dir.glob('seed_*')):
+        pred_file = seed_dir / 'test_predictions.parquet'
+        if pred_file.exists():
+            pred_df = pd.read_parquet(pred_file)
+            all_predictions.append(pred_df)
+
+    if not all_predictions:
+        return {'error': 'No prediction files found'}
+
+    # Concatenate all predictions
+    pooled_df = pd.concat(all_predictions, ignore_index=True)
+
+    # Compute disturbance per tile using pre/post data
+    tile_stats = []
+    for tile_id in pooled_df['tile_id'].unique():
+        pre_data = gedi_df[(gedi_df['tile_id'] == tile_id) &
+                           (gedi_df['year'].isin(pre_years))]
+        pre_mean = pre_data['agbd'].mean() if len(pre_data) > 0 else np.nan
+
+        post_data = gedi_df[(gedi_df['tile_id'] == tile_id) &
+                            (gedi_df['year'].isin(post_years))]
+        post_mean = post_data['agbd'].mean() if len(post_data) > 0 else np.nan
+
+        # Expected value (linear interpolation assumption)
+        if not np.isnan(pre_mean) and not np.isnan(post_mean):
+            expected = (pre_mean + post_mean) / 2
+        elif not np.isnan(pre_mean):
+            expected = pre_mean
+        elif not np.isnan(post_mean):
+            expected = post_mean
+        else:
+            expected = np.nan
+
+        # Test mean from pooled predictions
+        tile_data = pooled_df[pooled_df['tile_id'] == tile_id]
+        test_mean = tile_data['agbd'].mean()
+
+        if not np.isnan(expected) and expected > 0:
+            disturbance = (expected - test_mean) / expected
+        else:
+            disturbance = np.nan
+
+        tile_stats.append({
+            'tile_id': tile_id,
+            'disturbance': disturbance,
+            'n_shots': len(tile_data)
+        })
+
+    tile_df = pd.DataFrame(tile_stats)
+
+    # Map disturbance to each shot
+    tile_disturbance = dict(zip(tile_df['tile_id'], tile_df['disturbance']))
+    pooled_df['disturbance'] = pooled_df['tile_id'].map(tile_disturbance)
+
+    # Define strata
+    stable_max = thresholds['stable_max']
+    disturbed_min = thresholds['disturbed_min']
+
+    stable_mask = (pooled_df['disturbance'] < stable_max) & (~pooled_df['disturbance'].isna())
+    moderate_mask = (pooled_df['disturbance'] >= stable_max) & (pooled_df['disturbance'] <= disturbed_min) & (~pooled_df['disturbance'].isna())
+    disturbed_mask = (pooled_df['disturbance'] > disturbed_min) & (~pooled_df['disturbance'].isna())
+
+    results = {
+        'stable': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
+        'moderate': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
+        'disturbed': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
+        'thresholds': thresholds,
+        'pooled': True,
+        'total_tiles': len(tile_df),
+        'total_shots': len(pooled_df)
+    }
+
+    def compute_stratum(mask, name):
+        subset = pooled_df[mask]
+        if len(subset) < 10:
+            return None
+        valid = ~subset['pred'].isna()
+        if valid.sum() < 10:
+            return None
+        preds = subset.loc[valid, 'pred'].values
+        targets = subset.loc[valid, 'agbd'].values
+        r2 = r2_score(targets, preds)
+        rmse = np.sqrt(np.mean((preds - targets) ** 2))
+        return {
+            'r2': float(r2),
+            'rmse': float(rmse),
+            'n_shots': int(valid.sum()),
+            'n_tiles': int(subset['tile_id'].nunique())
+        }
+
+    for mask, name in [(stable_mask, 'stable'), (moderate_mask, 'moderate'), (disturbed_mask, 'disturbed')]:
+        result = compute_stratum(mask, name)
+        if result:
+            results[name] = result
+
+    return results

@@ -26,7 +26,11 @@ from pathlib import Path
 from datetime import datetime
 import numpy as np
 
-from utils.disturbance import aggregate_stratified_r2, print_aggregated_stratified_r2
+from utils.disturbance import (
+    aggregate_stratified_r2,
+    print_aggregated_stratified_r2,
+    compute_pooled_stratified_r2
+)
 
 # Get project root directory for PYTHONPATH
 PROJECT_ROOT = Path(__file__).parent.resolve()
@@ -322,6 +326,31 @@ def main():
     aggregated['experiment_config'] = experiment_config
     aggregated['completed_at'] = datetime.now().isoformat()
 
+    # Compute pooled stratified R² (more robust than averaging across seeds)
+    try:
+        import pickle
+        import pandas as pd
+        # Load GEDI data from first successful seed
+        gedi_df = None
+        for seed_dir in sorted(output_dir.glob('seed_*')):
+            pkl_file = seed_dir / 'processed_data.pkl'
+            if pkl_file.exists():
+                with open(pkl_file, 'rb') as f:
+                    gedi_df = pickle.load(f)
+                # Ensure year column exists
+                if 'year' not in gedi_df.columns:
+                    gedi_df['year'] = pd.to_datetime(gedi_df['time']).dt.year
+                break
+
+        if gedi_df is not None:
+            pooled_stratified = compute_pooled_stratified_r2(
+                output_dir, gedi_df, args.pre_years, args.post_years
+            )
+            aggregated['pooled_stratified_r2'] = pooled_stratified
+            print("\nComputed pooled stratified R² across all seeds")
+    except Exception as e:
+        print(f"\nWarning: Could not compute pooled stratified R²: {e}")
+
     with open(output_dir / 'aggregated_results.json', 'w') as f:
         json.dump(aggregated, f, indent=2)
 
@@ -354,9 +383,27 @@ def main():
         if aggregated['disturbance'].get('error_disturbance_correlation', {}).get('mean') is not None:
             print(f"  Error-disturbance correlation: r={aggregated['disturbance']['error_disturbance_correlation']['mean']:.3f} ± {aggregated['disturbance']['error_disturbance_correlation']['std']:.3f}")
 
-    # Print stratified R² using shared utility
+    # Print stratified R² using shared utility (per-seed averaging)
     if aggregated.get('stratified_r2'):
+        print("\n(Per-seed averaged - see pooled_stratified_r2 for more robust analysis)")
         print_aggregated_stratified_r2(aggregated['stratified_r2'])
+
+    # Print pooled stratified R² (more robust)
+    if aggregated.get('pooled_stratified_r2') and not aggregated['pooled_stratified_r2'].get('error'):
+        pooled = aggregated['pooled_stratified_r2']
+        thresholds = pooled.get('thresholds', {'stable_max': 0.1, 'disturbed_min': 0.3})
+        stable_max = int(thresholds['stable_max'] * 100)
+        disturbed_min = int(thresholds['disturbed_min'] * 100)
+
+        print(f"\nPooled Stratified R² (all seeds combined, {pooled['total_tiles']} tiles, {pooled['total_shots']} shots):")
+        for stratum, label in [('stable', f'Stable (<{stable_max}% change)'),
+                               ('moderate', f'Moderate ({stable_max}-{disturbed_min}%)'),
+                               ('disturbed', f'Disturbed (>{disturbed_min}% loss)')]:
+            s = pooled.get(stratum, {})
+            if s.get('r2') is not None:
+                print(f"  {label:24s} R²={s['r2']:.4f}, RMSE={s['rmse']:.2f} Mg/ha ({s['n_shots']} shots, {s['n_tiles']} tiles)")
+            else:
+                print(f"  {label:24s} Not enough data")
 
     print(f"\nResults saved to: {output_dir}")
 
