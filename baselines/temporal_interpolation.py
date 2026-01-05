@@ -98,11 +98,17 @@ def filter_shots_by_shapefile(df: pd.DataFrame, shapefile_path: str) -> pd.DataF
     from shapely.geometry import Point
 
     gdf = gpd.read_file(shapefile_path)
+    print(f"  Shapefile CRS: {gdf.crs}")
+    print(f"  Shapefile bounds (original): {gdf.total_bounds}")
 
     if gdf.crs is None:
         gdf = gdf.set_crs('EPSG:4326')
     elif gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs('EPSG:4326')
+
+    print(f"  Shapefile bounds (WGS84): {gdf.total_bounds}")
+    print(f"  GEDI lon range: [{df['longitude'].min():.4f}, {df['longitude'].max():.4f}]")
+    print(f"  GEDI lat range: [{df['latitude'].min():.4f}, {df['latitude'].max():.4f}]")
 
     points = gpd.GeoSeries(
         [Point(lon, lat) for lon, lat in zip(df['longitude'], df['latitude'])],
