@@ -36,6 +36,8 @@ def parse_args():
     # Region and temporal arguments
     parser.add_argument('--region_bbox', type=float, nargs=4, required=True,
                         help='Region bounding box: min_lon min_lat max_lon max_lat')
+    parser.add_argument('--fire_shapefile', type=str, default=None,
+                        help='Optional: Path to fire boundary shapefile (.shp) to filter GEDI shots')
     parser.add_argument('--train_years', type=int, nargs='+', required=True,
                         help='Years to use for training')
     parser.add_argument('--test_year', type=int, required=True,
@@ -94,6 +96,10 @@ def run_single_seed(seed: int, args, seed_output_dir: Path) -> dict:
         '--embeddings_dir', args.embeddings_dir,
         '--device', args.device,
     ]
+
+    # Add optional fire shapefile filter
+    if args.fire_shapefile:
+        cmd.extend(['--fire_shapefile', args.fire_shapefile])
 
     print(f"\n{'='*80}")
     print(f"Running seed {seed}")

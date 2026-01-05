@@ -49,6 +49,8 @@ def parse_args():
 
     parser.add_argument('--region_bbox', type=float, nargs=4, required=True,
                         help='Region bounding box')
+    parser.add_argument('--fire_shapefile', type=str, default=None,
+                        help='Optional: Path to fire boundary shapefile (.shp) to filter GEDI shots')
     parser.add_argument('--pre_years', type=int, nargs='+', required=True,
                         help='Years before event (e.g., 2019 2020)')
     parser.add_argument('--post_years', type=int, nargs='+', required=True,
@@ -88,6 +90,32 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def filter_shots_by_shapefile(df: pd.DataFrame, shapefile_path: str) -> pd.DataFrame:
+    """Filter GEDI shots to those inside a shapefile boundary."""
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    gdf = gpd.read_file(shapefile_path)
+
+    if gdf.crs is None:
+        gdf = gdf.set_crs('EPSG:4326')
+    elif gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs('EPSG:4326')
+
+    points = gpd.GeoSeries(
+        [Point(lon, lat) for lon, lat in zip(df['longitude'], df['latitude'])],
+        crs='EPSG:4326'
+    )
+
+    geometry = gdf.union_all() if hasattr(gdf, 'union_all') else gdf.unary_union
+    within_mask = points.within(geometry)
+
+    filtered_df = df[within_mask.values].copy()
+    print(f"Filtered to {len(filtered_df)} shots inside fire perimeter (from {len(df)})")
+
+    return filtered_df
 
 
 def train_spatial_model(
@@ -420,6 +448,14 @@ def main():
     )
     gedi_df['year'] = pd.to_datetime(gedi_df['time']).dt.year
     print(f"Retrieved {len(gedi_df)} shots")
+
+    # Apply fire shapefile filter if specified
+    if args.fire_shapefile:
+        print(f"\nApplying fire perimeter filter from: {args.fire_shapefile}")
+        gedi_df = filter_shots_by_shapefile(gedi_df, args.fire_shapefile)
+        if len(gedi_df) == 0:
+            print("No GEDI shots inside fire perimeter. Exiting.")
+            return
 
     # Extract embeddings (reuse same extractor to avoid reinitializing GeoTessera)
     print("\nExtracting embeddings...")
