@@ -57,6 +57,8 @@ def parse_args():
                         help='Years after event (e.g., 2022 2023)')
     parser.add_argument('--test_year', type=int, required=True,
                         help='Event year to test on (e.g., 2021)')
+    parser.add_argument('--test_months', type=int, nargs='+', default=None,
+                        help='Optional: Filter test year to specific months (e.g., 8 9 10 11 12 for Aug-Dec)')
     parser.add_argument('--output_dir', type=str, required=True,
                         help='Output directory')
 
@@ -485,6 +487,14 @@ def main():
         buffer_size=0.1, random_state=args.seed
     )
     train_df_full, val_df_full, test_df = splitter.split()
+
+    # Filter test data to specific months if specified
+    if args.test_months:
+        test_df['month'] = pd.to_datetime(test_df['time']).dt.month
+        original_count = len(test_df)
+        test_df = test_df[test_df['month'].isin(args.test_months)].copy()
+        test_df = test_df.drop(columns=['month'])
+        print(f"Filtered test data to months {args.test_months}: {len(test_df)} shots (from {original_count})")
 
     # Split train data into pre and post
     pre_train_df = train_df_full[train_df_full['year'].isin(args.pre_years)]

@@ -60,6 +60,8 @@ def parse_args():
                         help='Years to use for training (e.g., 2019 2020 2022 2023)')
     parser.add_argument('--test_year', type=int, required=True,
                         help='Year to hold out for testing (e.g., 2021)')
+    parser.add_argument('--test_months', type=int, nargs='+', default=None,
+                        help='Optional: Filter test year to specific months (e.g., 8 9 10 11 12 for Aug-Dec)')
     parser.add_argument('--cache_dir', type=str, default='./cache',
                         help='Directory for caching GEDI query results')
     parser.add_argument('--embeddings_dir', type=str, default='./embeddings',
@@ -503,6 +505,14 @@ def main():
         random_state=args.seed
     )
     train_df, val_df, test_df = splitter.split()
+
+    # Filter test data to specific months if specified
+    if args.test_months:
+        test_df['month'] = pd.to_datetime(test_df['time']).dt.month
+        original_count = len(test_df)
+        test_df = test_df[test_df['month'].isin(args.test_months)].copy()
+        test_df = test_df.drop(columns=['month'])
+        print(f"Filtered test data to months {args.test_months}: {len(test_df)} shots (from {original_count})")
     print()
 
     # Compute global bounds from training data

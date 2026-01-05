@@ -42,6 +42,8 @@ def parse_args():
                         help='Years to use for training')
     parser.add_argument('--test_year', type=int, required=True,
                         help='Year to hold out for testing')
+    parser.add_argument('--test_months', type=int, nargs='+', default=None,
+                        help='Optional: Filter test year to specific months (e.g., 8 9 10 11 12 for Aug-Dec)')
 
     # Experiment arguments
     parser.add_argument('--n_seeds', type=int, default=10,
@@ -100,6 +102,10 @@ def run_single_seed(seed: int, args, seed_output_dir: Path) -> dict:
     # Add optional fire shapefile filter
     if args.fire_shapefile:
         cmd.extend(['--fire_shapefile', args.fire_shapefile])
+
+    # Add optional test months filter
+    if args.test_months:
+        cmd.extend(['--test_months', *[str(m) for m in args.test_months]])
 
     print(f"\n{'='*80}")
     print(f"Running seed {seed}")
@@ -252,8 +258,10 @@ def main():
     # Save experiment config
     experiment_config = {
         'region_bbox': args.region_bbox,
+        'fire_shapefile': args.fire_shapefile,
         'train_years': args.train_years,
         'test_year': args.test_year,
+        'test_months': args.test_months,
         'n_seeds': args.n_seeds,
         'start_seed': args.start_seed,
         'architecture_mode': args.architecture_mode,
