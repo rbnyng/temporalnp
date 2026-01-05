@@ -29,6 +29,8 @@ def _make_serializable(obj: Any) -> Any:
         return {key: _make_serializable(value) for key, value in obj.items()}
     elif isinstance(obj, (list, tuple)):
         return [_make_serializable(item) for item in obj]
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
     elif isinstance(obj, (np.integer, np.floating)):
         return obj.item()
     elif isinstance(obj, np.ndarray):
