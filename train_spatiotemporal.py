@@ -745,6 +745,7 @@ def main():
     if test_metrics:
         print(f"  Log R²: {test_metrics.get('log_r2', 0):.4f}")
         print(f"  Log RMSE: {test_metrics.get('log_rmse', 0):.4f}")
+        print(f"  Linear R²: {test_metrics.get('linear_r2', 0):.4f}")
         print(f"  Linear RMSE: {test_metrics.get('linear_rmse', 0):.2f} Mg/ha")
         print(f"  Linear MAE: {test_metrics.get('linear_mae', 0):.2f} Mg/ha")
         # UQ calibration metrics

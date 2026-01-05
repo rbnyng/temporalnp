@@ -139,9 +139,12 @@ def aggregate_results(all_results: list) -> dict:
             'n_successful': 0
         }
 
-    # Extract metrics
-    test_r2 = [r['test_metrics'].get('log_r2', 0) for r in successful if r.get('test_metrics')]
-    test_rmse = [r['test_metrics'].get('linear_rmse', 0) for r in successful if r.get('test_metrics')]
+    # Extract metrics (matching baseline format)
+    log_r2 = [r['test_metrics'].get('log_r2', 0) for r in successful if r.get('test_metrics')]
+    log_rmse = [r['test_metrics'].get('log_rmse', 0) for r in successful if r.get('test_metrics')]
+    linear_r2 = [r['test_metrics'].get('linear_r2', 0) for r in successful if r.get('test_metrics')]
+    linear_rmse = [r['test_metrics'].get('linear_rmse', 0) for r in successful if r.get('test_metrics')]
+    linear_mae = [r['test_metrics'].get('linear_mae', 0) for r in successful if r.get('test_metrics')]
     train_times = [r.get('train_time', 0) for r in successful]
 
     # Extract calibration metrics
@@ -164,17 +167,32 @@ def aggregate_results(all_results: list) -> dict:
     aggregated = {
         'n_seeds': len(all_results),
         'n_successful': len(successful),
-        'test_r2': {
-            'mean': float(np.mean(test_r2)) if test_r2 else None,
-            'std': float(np.std(test_r2)) if test_r2 else None,
-            'min': float(np.min(test_r2)) if test_r2 else None,
-            'max': float(np.max(test_r2)) if test_r2 else None,
-            'values': test_r2
+        'log_r2': {
+            'mean': float(np.mean(log_r2)) if log_r2 else None,
+            'std': float(np.std(log_r2)) if log_r2 else None,
+            'min': float(np.min(log_r2)) if log_r2 else None,
+            'max': float(np.max(log_r2)) if log_r2 else None,
+            'values': log_r2
         },
-        'test_rmse': {
-            'mean': float(np.mean(test_rmse)) if test_rmse else None,
-            'std': float(np.std(test_rmse)) if test_rmse else None,
-            'values': test_rmse
+        'log_rmse': {
+            'mean': float(np.mean(log_rmse)) if log_rmse else None,
+            'std': float(np.std(log_rmse)) if log_rmse else None,
+            'values': log_rmse
+        },
+        'linear_r2': {
+            'mean': float(np.mean(linear_r2)) if linear_r2 else None,
+            'std': float(np.std(linear_r2)) if linear_r2 else None,
+            'values': linear_r2
+        },
+        'linear_rmse': {
+            'mean': float(np.mean(linear_rmse)) if linear_rmse else None,
+            'std': float(np.std(linear_rmse)) if linear_rmse else None,
+            'values': linear_rmse
+        },
+        'linear_mae': {
+            'mean': float(np.mean(linear_mae)) if linear_mae else None,
+            'std': float(np.std(linear_mae)) if linear_mae else None,
+            'values': linear_mae
         },
         'train_time': {
             'mean': float(np.mean(train_times)) if train_times else None,
@@ -287,14 +305,16 @@ def main():
     print("=" * 80)
     print(f"Successful runs: {aggregated['n_successful']}/{aggregated['n_seeds']}")
 
-    if aggregated.get('test_r2', {}).get('mean') is not None:
-        print(f"\nTest R² (log-space):")
-        print(f"  Mean: {aggregated['test_r2']['mean']:.4f} ± {aggregated['test_r2']['std']:.4f}")
-        print(f"  Range: [{aggregated['test_r2']['min']:.4f}, {aggregated['test_r2']['max']:.4f}]")
+    if aggregated.get('log_r2', {}).get('mean') is not None:
+        print(f"\nLog-space metrics:")
+        print(f"  R²:   {aggregated['log_r2']['mean']:.4f} ± {aggregated['log_r2']['std']:.4f}  (range: [{aggregated['log_r2']['min']:.4f}, {aggregated['log_r2']['max']:.4f}])")
+        print(f"  RMSE: {aggregated['log_rmse']['mean']:.4f} ± {aggregated['log_rmse']['std']:.4f}")
 
-    if aggregated.get('test_rmse', {}).get('mean') is not None:
-        print(f"\nTest RMSE (Mg/ha):")
-        print(f"  Mean: {aggregated['test_rmse']['mean']:.2f} ± {aggregated['test_rmse']['std']:.2f}")
+    if aggregated.get('linear_r2', {}).get('mean') is not None:
+        print(f"\nLinear-space metrics:")
+        print(f"  R²:   {aggregated['linear_r2']['mean']:.4f} ± {aggregated['linear_r2']['std']:.4f}")
+        print(f"  RMSE: {aggregated['linear_rmse']['mean']:.2f} ± {aggregated['linear_rmse']['std']:.2f} Mg/ha")
+        print(f"  MAE:  {aggregated['linear_mae']['mean']:.2f} ± {aggregated['linear_mae']['std']:.2f} Mg/ha")
 
     if aggregated.get('train_time', {}).get('total') is not None:
         print(f"\nTotal training time: {aggregated['train_time']['total']/3600:.2f} hours")
