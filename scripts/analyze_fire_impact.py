@@ -497,9 +497,9 @@ def main():
         change_stats['severity_analysis'] = severity_stats
 
         print("\nPost-fire AGBD by Burn Severity:")
-        for severity, stats in severity_stats.items():
-            print(f"  {severity.capitalize()}: {stats['mean_agbd']:.1f} ± {stats['std_agbd']:.1f} Mg/ha "
-                  f"(n={stats['n_shots']})")
+        for severity, sev_stats in severity_stats.items():
+            print(f"  {severity.capitalize()}: {sev_stats['mean_agbd']:.1f} ± {sev_stats['std_agbd']:.1f} Mg/ha "
+                  f"(n={sev_stats['n_shots']})")
 
     # Compute control area statistics (outside fire but in bbox)
     outside_fire = filter_shots_by_geometry(gedi_df, fire_boundary.geometry, inside=False)
