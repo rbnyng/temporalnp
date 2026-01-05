@@ -427,6 +427,60 @@ def main():
             'post_fire_months_mean': float(post_fire_months['agbd'].mean()) if len(post_fire_months) > 0 else None
         }
 
+    # Paired tile-level analysis (controls for GEDI track sampling bias)
+    print(f"\n" + "=" * 80)
+    print("PAIRED TILE-LEVEL ANALYSIS (Controls for Sampling Bias)")
+    print("=" * 80)
+
+    # Compute tile-level means for pre and post periods
+    pre_tile_means = pre_fire_df.groupby('tile_id')['agbd'].agg(['mean', 'count']).rename(
+        columns={'mean': 'pre_mean', 'count': 'pre_count'})
+    post_tile_means = post_fire_df.groupby('tile_id')['agbd'].agg(['mean', 'count']).rename(
+        columns={'mean': 'post_mean', 'count': 'post_count'})
+
+    # Find tiles with shots in BOTH periods
+    paired_tiles = pre_tile_means.join(post_tile_means, how='inner')
+    paired_tiles['change'] = paired_tiles['post_mean'] - paired_tiles['pre_mean']
+
+    print(f"\nTiles with shots in both pre ({args.pre_years}) and post ({args.post_years}): {len(paired_tiles)}")
+    print(f"Total tiles in fire area: {inside_fire['tile_id'].nunique()}")
+
+    if len(paired_tiles) >= 5:
+        # Paired t-test (same tiles, before vs after)
+        paired_t, paired_p = stats.ttest_rel(paired_tiles['pre_mean'], paired_tiles['post_mean'])
+
+        print(f"\nPaired tile-level comparison:")
+        print(f"  Pre-fire mean (across tiles):  {paired_tiles['pre_mean'].mean():.1f} Mg/ha")
+        print(f"  Post-fire mean (across tiles): {paired_tiles['post_mean'].mean():.1f} Mg/ha")
+        print(f"  Mean change per tile:          {paired_tiles['change'].mean():.1f} Mg/ha")
+        print(f"  Median change per tile:        {paired_tiles['change'].median():.1f} Mg/ha")
+        print(f"  Tiles with biomass loss:       {(paired_tiles['change'] < 0).sum()} / {len(paired_tiles)} ({(paired_tiles['change'] < 0).mean()*100:.1f}%)")
+        print(f"\n  Paired t-test: t={paired_t:.2f}, p={paired_p:.2e}")
+        print(f"  Significant at α=0.05: {paired_p < 0.05}")
+
+        # Breakdown by magnitude of change
+        print(f"\n  Distribution of tile-level changes:")
+        print(f"    Large loss (< -50 Mg/ha):    {(paired_tiles['change'] < -50).sum()} tiles")
+        print(f"    Moderate loss (-50 to -20):  {((paired_tiles['change'] >= -50) & (paired_tiles['change'] < -20)).sum()} tiles")
+        print(f"    Small loss (-20 to 0):       {((paired_tiles['change'] >= -20) & (paired_tiles['change'] < 0)).sum()} tiles")
+        print(f"    Stable/gain (>= 0):          {(paired_tiles['change'] >= 0).sum()} tiles")
+
+        change_stats['paired_tile_analysis'] = {
+            'n_paired_tiles': len(paired_tiles),
+            'pre_mean': float(paired_tiles['pre_mean'].mean()),
+            'post_mean': float(paired_tiles['post_mean'].mean()),
+            'mean_change': float(paired_tiles['change'].mean()),
+            'median_change': float(paired_tiles['change'].median()),
+            'pct_tiles_with_loss': float((paired_tiles['change'] < 0).mean() * 100),
+            'paired_t_stat': float(paired_t),
+            'paired_p_value': float(paired_p)
+        }
+
+        # Save paired tile data
+        paired_tiles.to_parquet(output_dir / 'paired_tile_analysis.parquet')
+    else:
+        print("  Not enough paired tiles for analysis")
+
     # Optional: Analyze by burn severity if dNBR provided
     if args.dnbr_raster and Path(args.dnbr_raster).exists():
         print("\n" + "=" * 80)
