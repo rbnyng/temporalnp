@@ -330,7 +330,8 @@ class GEDISpatiotemporalDataset(Dataset):
         coord_noise_std: float = 0.01,
         global_bounds: Optional[Tuple[float, float, float, float]] = None,
         temporal_bounds: Optional[Tuple[float, float]] = None,
-        time_column: str = 'time'
+        time_column: str = 'time',
+        include_temporal: bool = True
     ):
         """
         Initialize spatiotemporal dataset.
@@ -350,15 +351,18 @@ class GEDISpatiotemporalDataset(Dataset):
             global_bounds: (lon_min, lat_min, lon_max, lat_max) for normalization
             temporal_bounds: (t_min, t_max) as unix timestamps for temporal normalization
             time_column: Name of the timestamp column in data_df
+            include_temporal: If True, include temporal encoding (5D coords).
+                            If False, use spatial coords only (2D coords).
         """
         self.data_df = data_df[data_df['embedding_patch'].notna()].copy()
         self.time_column = time_column
+        self.include_temporal = include_temporal
 
         # Ensure timestamp column exists
         if time_column not in self.data_df.columns:
             raise ValueError(f"Time column '{time_column}' not found in dataframe")
 
-        # Compute temporal encoding for all data
+        # Compute temporal encoding for all data (even if not used, for consistency)
         if temporal_bounds is None:
             timestamps = pd.to_datetime(self.data_df[time_column])
             unix_time = timestamps.astype(np.int64) / 1e9
@@ -397,7 +401,8 @@ class GEDISpatiotemporalDataset(Dataset):
         else:
             self.lon_min, self.lat_min, self.lon_max, self.lat_max = global_bounds
 
-        print(f"Spatiotemporal dataset initialized with {len(self.tiles)} tiles")
+        mode = "spatiotemporal (5D)" if include_temporal else "spatial-only (2D)"
+        print(f"Dataset initialized with {len(self.tiles)} tiles, coords: {mode}")
         if len(self.tiles) > 0:
             shots_per_tile = [len(t) for t in self.tiles]
             print(f"Shots per tile: min={min(shots_per_tile)}, "
@@ -416,10 +421,10 @@ class GEDISpatiotemporalDataset(Dataset):
         Get a training sample with spatiotemporal features.
 
         Returns a dict with:
-            - context_coords: (n_context, 5) [lon, lat, sin_doy, cos_doy, norm_time]
+            - context_coords: (n_context, D) where D=5 if include_temporal else D=2
             - context_embeddings: (n_context, patch_size, patch_size, 128)
             - context_agbd: (n_context, 1)
-            - target_coords: (n_target, 5)
+            - target_coords: (n_target, D)
             - target_embeddings: (n_target, patch_size, patch_size, 128)
             - target_agbd: (n_target, 1)
         """
@@ -434,7 +439,6 @@ class GEDISpatiotemporalDataset(Dataset):
 
         # Extract features
         spatial_coords = tile_data[['longitude', 'latitude']].values
-        temporal_encoding = np.stack(tile_data['temporal_encoding'].values)
         embeddings = np.stack(tile_data['embedding_patch'].values)
         agbd = tile_data['agbd'].values[:, None]
 
@@ -446,8 +450,12 @@ class GEDISpatiotemporalDataset(Dataset):
             spatial_coords = spatial_coords + np.random.normal(0, self.coord_noise_std, spatial_coords.shape)
             spatial_coords = np.clip(spatial_coords, 0, 1)
 
-        # Combine spatial and temporal into full coordinate vector
-        coords = np.concatenate([spatial_coords, temporal_encoding], axis=1)
+        # Build coordinate vector: spatial only or spatiotemporal
+        if self.include_temporal:
+            temporal_encoding = np.stack(tile_data['temporal_encoding'].values)
+            coords = np.concatenate([spatial_coords, temporal_encoding], axis=1)
+        else:
+            coords = spatial_coords
 
         if self.normalize_agbd:
             agbd = normalize_agbd(agbd, self.agbd_scale, self.log_transform_agbd)

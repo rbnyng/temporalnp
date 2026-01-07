@@ -83,6 +83,8 @@ def parse_args():
                         help='Architecture mode')
     parser.add_argument('--num_attention_heads', type=int, default=16,
                         help='Number of attention heads')
+    parser.add_argument('--no_temporal_encoding', action='store_true',
+                        help='Disable temporal encoding (spatial-only baseline with 2D coords)')
 
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=4,
@@ -540,6 +542,7 @@ def main():
     # Step 4: Create datasets (no max_shots_per_tile - using runtime subsampling instead)
     print("\nStep 4: Creating datasets...")
     print(f"  Runtime subsampling: max_context={args.max_context_shots}, max_target={args.max_target_shots}")
+    include_temporal = not args.no_temporal_encoding
     train_dataset = GEDISpatiotemporalDataset(
         train_df,
         min_shots_per_tile=args.min_shots_per_tile,
@@ -548,7 +551,8 @@ def main():
         augment_coords=args.augment_coords,
         coord_noise_std=args.coord_noise_std,
         global_bounds=global_bounds,
-        temporal_bounds=temporal_bounds
+        temporal_bounds=temporal_bounds,
+        include_temporal=include_temporal
     )
     val_dataset = GEDISpatiotemporalDataset(
         val_df,
@@ -557,7 +561,8 @@ def main():
         log_transform_agbd=args.log_transform_agbd,
         augment_coords=False,
         global_bounds=global_bounds,
-        temporal_bounds=temporal_bounds
+        temporal_bounds=temporal_bounds,
+        include_temporal=include_temporal
     )
     test_dataset = GEDISpatiotemporalDataset(
         test_df,
@@ -566,7 +571,8 @@ def main():
         log_transform_agbd=args.log_transform_agbd,
         augment_coords=False,
         global_bounds=global_bounds,
-        temporal_bounds=temporal_bounds
+        temporal_bounds=temporal_bounds,
+        include_temporal=include_temporal
     )
 
     train_loader = DataLoader(
@@ -583,10 +589,14 @@ def main():
     )
     print()
 
-    # Step 5: Initialize model with coord_dim=5 for spatiotemporal
+    # Step 5: Initialize model with appropriate coord_dim
     print("Step 5: Initializing model...")
     print(f"Architecture mode: {args.architecture_mode}")
-    print(f"Coordinate dimension: 5 (lon, lat, sin_doy, cos_doy, norm_time)")
+    coord_dim = 2 if args.no_temporal_encoding else 5
+    if args.no_temporal_encoding:
+        print(f"Coordinate dimension: 2 (lon, lat) - spatial-only baseline")
+    else:
+        print(f"Coordinate dimension: 5 (lon, lat, sin_doy, cos_doy, norm_time)")
 
     model = GEDINeuralProcess(
         patch_size=args.patch_size,
@@ -598,7 +608,7 @@ def main():
         output_uncertainty=True,
         architecture_mode=args.architecture_mode,
         num_attention_heads=args.num_attention_heads,
-        coord_dim=5  # Spatiotemporal: lon, lat, sin_doy, cos_doy, norm_time
+        coord_dim=coord_dim
     ).to(args.device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

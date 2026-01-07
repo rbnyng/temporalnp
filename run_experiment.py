@@ -71,6 +71,8 @@ def parse_args():
                         help='Maximum context shots per tile (runtime subsampling)')
     parser.add_argument('--max_target_shots', type=int, default=1024,
                         help='Maximum target shots per tile (runtime subsampling)')
+    parser.add_argument('--no_temporal_encoding', action='store_true',
+                        help='Disable temporal encoding (spatial-only baseline)')
 
     # Infrastructure
     parser.add_argument('--cache_dir', type=str, default='./cache',
@@ -110,6 +112,10 @@ def run_single_seed(seed: int, args, seed_output_dir: Path) -> dict:
     # Add optional test months filter
     if args.test_months:
         cmd.extend(['--test_months', *[str(m) for m in args.test_months]])
+
+    # Add spatial-only baseline flag
+    if args.no_temporal_encoding:
+        cmd.append('--no_temporal_encoding')
 
     print(f"\n{'='*80}")
     print(f"Running seed {seed}")
