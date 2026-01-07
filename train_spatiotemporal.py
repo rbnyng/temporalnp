@@ -285,13 +285,18 @@ def predict_on_test_df(
     global_bounds: tuple,
     temporal_bounds: tuple,
     device: str,
-    max_context_shots: int = 1024
+    max_context_shots: int = 1024,
+    include_temporal: bool = True
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Generate predictions on test_df while preserving shot order.
 
     Uses tile-based context selection (same tile from context_df).
     Returns predictions and uncertainties aligned with test_df index.
+
+    Args:
+        include_temporal: If True, use 5D coords (lon, lat, sin_doy, cos_doy, norm_time).
+                         If False, use 2D coords (lon, lat) for spatial-only baseline.
     """
     model.eval()
 
@@ -340,9 +345,12 @@ def predict_on_test_df(
             ctx_coords_norm[:, 0] = (ctx_coords[:, 0] - lon_min) / (lon_max - lon_min + 1e-8)
             ctx_coords_norm[:, 1] = (ctx_coords[:, 1] - lat_min) / (lat_max - lat_min + 1e-8)
 
-            # Compute temporal encoding for context and concatenate with spatial coords
-            ctx_temporal = compute_temporal_encoding(ctx_time, temporal_bounds)
-            ctx_spatiotemporal = np.concatenate([ctx_coords_norm, ctx_temporal], axis=1)
+            # Build coordinate vector: spatial only or spatiotemporal
+            if include_temporal:
+                ctx_temporal = compute_temporal_encoding(ctx_time, temporal_bounds)
+                ctx_final_coords = np.concatenate([ctx_coords_norm, ctx_temporal], axis=1)
+            else:
+                ctx_final_coords = ctx_coords_norm
 
             ctx_agbd_norm = normalize_agbd(ctx_agbd)
 
@@ -355,15 +363,18 @@ def predict_on_test_df(
             tgt_coords_norm[:, 0] = (tgt_coords[:, 0] - lon_min) / (lon_max - lon_min + 1e-8)
             tgt_coords_norm[:, 1] = (tgt_coords[:, 1] - lat_min) / (lat_max - lat_min + 1e-8)
 
-            # Compute temporal encoding for targets and concatenate
-            tgt_temporal = compute_temporal_encoding(tgt_time, temporal_bounds)
-            tgt_spatiotemporal = np.concatenate([tgt_coords_norm, tgt_temporal], axis=1)
+            # Build target coordinate vector
+            if include_temporal:
+                tgt_temporal = compute_temporal_encoding(tgt_time, temporal_bounds)
+                tgt_final_coords = np.concatenate([tgt_coords_norm, tgt_temporal], axis=1)
+            else:
+                tgt_final_coords = tgt_coords_norm
 
             # To tensors
-            ctx_coords_t = torch.from_numpy(ctx_spatiotemporal).float().to(device)
+            ctx_coords_t = torch.from_numpy(ctx_final_coords).float().to(device)
             ctx_embeddings_t = torch.from_numpy(ctx_embeddings).float().to(device)
             ctx_agbd_t = torch.from_numpy(ctx_agbd_norm).float().to(device)
-            tgt_coords_t = torch.from_numpy(tgt_spatiotemporal).float().to(device)
+            tgt_coords_t = torch.from_numpy(tgt_final_coords).float().to(device)
             tgt_embeddings_t = torch.from_numpy(tgt_embeddings).float().to(device)
 
             # Predict
@@ -784,7 +795,8 @@ def main():
     test_preds_log, test_unc_log = predict_on_test_df(
         model, test_df, test_df,  # Use test_df as context (same-tile, same-year context)
         global_bounds, temporal_bounds, args.device,
-        max_context_shots=args.max_context_shots
+        max_context_shots=args.max_context_shots,
+        include_temporal=include_temporal
     )
     # Denormalize predictions to linear scale for disturbance analysis
     test_preds_linear = denormalize_agbd(test_preds_log)
