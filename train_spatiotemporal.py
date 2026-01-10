@@ -85,6 +85,9 @@ def parse_args():
                         help='Number of attention heads')
     parser.add_argument('--no_temporal_encoding', action='store_true',
                         help='Disable temporal encoding (spatial-only baseline with 2D coords)')
+    parser.add_argument('--temporal_context', action='store_true',
+                        help='Use train years as context for test prediction (true temporal prediction). '
+                             'Without this flag, test year data is used as context (spatial interpolation).')
 
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=4,
@@ -789,11 +792,22 @@ def main():
             print(f"    Coverage 3σ:  {test_metrics.get('coverage_3sigma', 0):.1f}% (ideal: 99.7%)")
 
     # Generate predictions with shot-level mapping for stratified analysis
-    # Use test_df itself as context (same tile, same year - like standard evaluation)
-    print("\n  Generating shot-level predictions for stratified analysis...")
     from utils.normalization import denormalize_agbd
+
+    if args.temporal_context:
+        # Use train years as context for true temporal prediction
+        # This tests the model's ability to predict held-out year from surrounding years
+        context_df = gedi_df[gedi_df['year'].isin(args.train_years)].copy()
+        print(f"\n  Generating predictions with TEMPORAL context (train years: {args.train_years})...")
+        print(f"    Context: {len(context_df)} shots from {args.train_years}")
+        print(f"    Targets: {len(test_df)} shots from {args.test_year}")
+    else:
+        # Use test_df itself as context (same tile, same year - spatial interpolation)
+        context_df = test_df
+        print("\n  Generating predictions with SAME-YEAR context (spatial interpolation)...")
+
     test_preds_log, test_unc_log = predict_on_test_df(
-        model, test_df, test_df,  # Use test_df as context (same-tile, same-year context)
+        model, test_df, context_df,
         global_bounds, temporal_bounds, args.device,
         max_context_shots=args.max_context_shots,
         include_temporal=include_temporal
