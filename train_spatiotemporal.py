@@ -799,8 +799,16 @@ def main():
         # This tests the model's ability to predict held-out year from surrounding years
         context_df = gedi_df[gedi_df['year'].isin(args.train_years)].copy()
         print(f"\n  Generating predictions with TEMPORAL context (train years: {args.train_years})...")
-        print(f"    Context: {len(context_df)} shots from {args.train_years}")
+        print(f"    Context pool: {len(context_df)} shots from {args.train_years}")
         print(f"    Targets: {len(test_df)} shots from {args.test_year}")
+
+        # Debug: Check overlap between test tiles and context tiles
+        test_tiles = set(test_df['tile_id'].unique())
+        context_tiles = set(context_df['tile_id'].unique())
+        overlap_tiles = test_tiles & context_tiles
+        print(f"    Test tiles: {len(test_tiles)}, Context tiles with train data: {len(overlap_tiles)}")
+        if len(overlap_tiles) == 0:
+            print("    WARNING: No test tiles have train year observations! Predictions will be NaN.")
     else:
         # Use test_df itself as context (same tile, same year - spatial interpolation)
         context_df = test_df
