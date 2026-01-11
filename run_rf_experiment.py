@@ -74,8 +74,8 @@ def parse_args():
                         help='Model type: rf (Random Forest), xgb (XGBoost), quantile_rf (Quantile RF)')
     parser.add_argument('--n_estimators', type=int, default=100,
                         help='Number of trees/estimators')
-    parser.add_argument('--max_depth', type=int, default=None,
-                        help='Maximum tree depth (None for unlimited)')
+    parser.add_argument('--max_depth', type=int, default=6,
+                        help='Maximum tree depth (default: 6 for better generalization)')
     parser.add_argument('--min_samples_leaf', type=int, default=5,
                         help='Minimum samples per leaf node')
     parser.add_argument('--include_temporal', action='store_true',

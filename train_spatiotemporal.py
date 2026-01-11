@@ -111,10 +111,10 @@ def parse_args():
                         help='Buffer size in degrees for spatial CV')
     parser.add_argument('--min_shots_per_tile', type=int, default=10,
                         help='Minimum GEDI shots per tile')
-    parser.add_argument('--max_context_shots', type=int, default=1024,
-                        help='Maximum context shots per tile during training (runtime subsampling)')
-    parser.add_argument('--max_target_shots', type=int, default=1024,
-                        help='Maximum target shots per tile during training (runtime subsampling)')
+    parser.add_argument('--max_context_shots', type=int, default=100000,
+                        help='Maximum context shots per tile during training (use high value to avoid limiting)')
+    parser.add_argument('--max_target_shots', type=int, default=10000,
+                        help='Maximum target shots per tile during training (use high value to avoid limiting)')
     parser.add_argument('--early_stopping_patience', type=int, default=25,
                         help='Early stopping patience')
     parser.add_argument('--lr_scheduler_patience', type=int, default=5,
