@@ -75,6 +75,8 @@ def parse_args():
                         help='Disable temporal encoding (spatial-only baseline)')
     parser.add_argument('--temporal_context', action='store_true',
                         help='Use train years as context for test prediction (true temporal prediction)')
+    parser.add_argument('--cross_year_training', action='store_true',
+                        help='Train with cross-year context/target splits (pairs with --temporal_context)')
 
     # Infrastructure
     parser.add_argument('--cache_dir', type=str, default='./cache',
@@ -122,6 +124,10 @@ def run_single_seed(seed: int, args, seed_output_dir: Path) -> dict:
     # Add temporal context flag (use train years as context for prediction)
     if args.temporal_context:
         cmd.append('--temporal_context')
+
+    # Add cross-year training flag (train with year-based context/target splits)
+    if args.cross_year_training:
+        cmd.append('--cross_year_training')
 
     print(f"\n{'='*80}")
     print(f"Running seed {seed}")
@@ -288,6 +294,7 @@ def main():
         'max_target_shots': args.max_target_shots,
         'no_temporal_encoding': args.no_temporal_encoding,
         'temporal_context': args.temporal_context,
+        'cross_year_training': args.cross_year_training,
         'started_at': datetime.now().isoformat()
     }
 

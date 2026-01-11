@@ -31,6 +31,7 @@ from data.gedi import GEDIQuerier
 from data.embeddings import EmbeddingExtractor
 from data.dataset import (
     GEDISpatiotemporalDataset,
+    CrossYearSpatiotemporalDataset,
     collate_neural_process,
     compute_temporal_encoding
 )
@@ -88,6 +89,10 @@ def parse_args():
     parser.add_argument('--temporal_context', action='store_true',
                         help='Use train years as context for test prediction (true temporal prediction). '
                              'Without this flag, test year data is used as context (spatial interpolation).')
+    parser.add_argument('--cross_year_training', action='store_true',
+                        help='Train with cross-year context/target splits. For each tile, randomly '
+                             'holds out one year as target and uses other years as context. '
+                             'This trains the model for the --temporal_context evaluation task.')
 
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=4,
@@ -557,7 +562,18 @@ def main():
     print("\nStep 4: Creating datasets...")
     print(f"  Runtime subsampling: max_context={args.max_context_shots}, max_target={args.max_target_shots}")
     include_temporal = not args.no_temporal_encoding
-    train_dataset = GEDISpatiotemporalDataset(
+
+    # Choose dataset class based on training mode
+    if args.cross_year_training:
+        print(f"  Training mode: CROSS-YEAR (context from other years, target from held-out year)")
+        DatasetClass = CrossYearSpatiotemporalDataset
+        extra_args = {'min_years_per_tile': 2}
+    else:
+        print(f"  Training mode: STANDARD (random context/target split within mixed years)")
+        DatasetClass = GEDISpatiotemporalDataset
+        extra_args = {}
+
+    train_dataset = DatasetClass(
         train_df,
         min_shots_per_tile=args.min_shots_per_tile,
         agbd_scale=args.agbd_scale,
@@ -566,8 +582,11 @@ def main():
         coord_noise_std=args.coord_noise_std,
         global_bounds=global_bounds,
         temporal_bounds=temporal_bounds,
-        include_temporal=include_temporal
+        include_temporal=include_temporal,
+        **extra_args
     )
+
+    # Validation and test always use standard dataset (we evaluate on specific years)
     val_dataset = GEDISpatiotemporalDataset(
         val_df,
         min_shots_per_tile=args.min_shots_per_tile,
