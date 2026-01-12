@@ -111,10 +111,12 @@ def parse_args():
                         help='Buffer size in degrees for spatial CV')
     parser.add_argument('--min_shots_per_tile', type=int, default=10,
                         help='Minimum GEDI shots per tile')
-    parser.add_argument('--max_context_shots', type=int, default=100000,
-                        help='Maximum context shots per tile during training (use high value to avoid limiting)')
-    parser.add_argument('--max_target_shots', type=int, default=10000,
-                        help='Maximum target shots per tile during training (use high value to avoid limiting)')
+    parser.add_argument('--max_context_shots', type=int, default=20000,
+                        help='Maximum context shots per tile (subsampled if exceeded for memory)')
+    parser.add_argument('--max_target_shots', type=int, default=5000,
+                        help='Maximum target shots per tile (subsampled if exceeded)')
+    parser.add_argument('--target_chunk_size', type=int, default=2000,
+                        help='Process targets in chunks of this size for memory efficiency')
     parser.add_argument('--early_stopping_patience', type=int, default=25,
                         help='Early stopping patience')
     parser.add_argument('--lr_scheduler_patience', type=int, default=5,
@@ -195,8 +197,19 @@ def filter_shots_by_shapefile(df: pd.DataFrame, shapefile_path: str) -> pd.DataF
 
 
 def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
-                max_context_shots=1024, max_target_shots=1024):
-    """Train for one epoch with optional runtime subsampling of context/targets."""
+                max_context_shots=20000, max_target_shots=5000, target_chunk_size=2000):
+    """Train for one epoch with chunked target processing to manage memory.
+
+    Args:
+        model: The neural process model
+        dataloader: Training data loader
+        optimizer: Optimizer
+        device: Device to train on
+        kl_weight: Weight for KL divergence term
+        max_context_shots: Maximum context shots (subsampled if exceeded)
+        max_target_shots: Maximum target shots per tile (subsampled if exceeded)
+        target_chunk_size: Process targets in chunks of this size for memory efficiency
+    """
     model.train()
     total_loss = 0
     total_nll = 0
@@ -237,32 +250,88 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
                 target_coords = target_coords[indices]
                 target_embeddings = target_embeddings[indices]
                 target_agbd = target_agbd[indices]
+                n_targets = max_target_shots
 
-            pred_mean, pred_log_var, z_mu_context, z_log_sigma_context, z_mu_all, z_log_sigma_all = model(
-                context_coords,
-                context_embeddings,
-                context_agbd,
-                target_coords,
-                target_embeddings,
-                query_agbd=target_agbd,
-                training=True
-            )
+            # Process targets in chunks if still too large for memory
+            if n_targets > target_chunk_size:
+                # Chunked processing - accumulate losses
+                chunk_losses = []
+                chunk_nlls = []
+                chunk_kls = []
 
-            loss, loss_dict = neural_process_loss(
-                pred_mean, pred_log_var, target_agbd,
-                z_mu_context, z_log_sigma_context,
-                z_mu_all, z_log_sigma_all,
-                kl_weight
-            )
+                # Shuffle targets for chunking
+                perm = torch.randperm(n_targets, device=device)
+                target_coords = target_coords[perm]
+                target_embeddings = target_embeddings[perm]
+                target_agbd = target_agbd[perm]
 
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"Warning: NaN/Inf loss detected! Skipping batch.")
-                continue
+                for chunk_start in range(0, n_targets, target_chunk_size):
+                    chunk_end = min(chunk_start + target_chunk_size, n_targets)
+                    chunk_target_coords = target_coords[chunk_start:chunk_end]
+                    chunk_target_embeddings = target_embeddings[chunk_start:chunk_end]
+                    chunk_target_agbd = target_agbd[chunk_start:chunk_end]
 
-            batch_loss += loss
-            batch_nll += loss_dict['nll']
-            batch_kl += loss_dict['kl']
-            n_tiles_in_batch += 1
+                    pred_mean, pred_log_var, z_mu_context, z_log_sigma_context, z_mu_all, z_log_sigma_all = model(
+                        context_coords,
+                        context_embeddings,
+                        context_agbd,
+                        chunk_target_coords,
+                        chunk_target_embeddings,
+                        query_agbd=chunk_target_agbd,
+                        training=True
+                    )
+
+                    loss, loss_dict = neural_process_loss(
+                        pred_mean, pred_log_var, chunk_target_agbd,
+                        z_mu_context, z_log_sigma_context,
+                        z_mu_all, z_log_sigma_all,
+                        kl_weight
+                    )
+
+                    if not (torch.isnan(loss) or torch.isinf(loss)):
+                        chunk_losses.append(loss * len(chunk_target_coords))
+                        chunk_nlls.append(loss_dict['nll'] * len(chunk_target_coords))
+                        chunk_kls.append(loss_dict['kl'] * len(chunk_target_coords))
+
+                if chunk_losses:
+                    # Weighted average by chunk size
+                    total_chunk_targets = sum(len(target_coords[i:i+target_chunk_size])
+                                             for i in range(0, n_targets, target_chunk_size))
+                    tile_loss = sum(chunk_losses) / total_chunk_targets
+                    tile_nll = sum(chunk_nlls) / total_chunk_targets
+                    tile_kl = sum(chunk_kls) / total_chunk_targets
+
+                    batch_loss += tile_loss
+                    batch_nll += tile_nll
+                    batch_kl += tile_kl
+                    n_tiles_in_batch += 1
+            else:
+                # Standard processing for smaller tiles
+                pred_mean, pred_log_var, z_mu_context, z_log_sigma_context, z_mu_all, z_log_sigma_all = model(
+                    context_coords,
+                    context_embeddings,
+                    context_agbd,
+                    target_coords,
+                    target_embeddings,
+                    query_agbd=target_agbd,
+                    training=True
+                )
+
+                loss, loss_dict = neural_process_loss(
+                    pred_mean, pred_log_var, target_agbd,
+                    z_mu_context, z_log_sigma_context,
+                    z_mu_all, z_log_sigma_all,
+                    kl_weight
+                )
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"Warning: NaN/Inf loss detected! Skipping batch.")
+                    continue
+
+                batch_loss += loss
+                batch_nll += loss_dict['nll']
+                batch_kl += loss_dict['kl']
+                n_tiles_in_batch += 1
 
         if n_tiles_in_batch > 0:
             batch_loss = batch_loss / n_tiles_in_batch
@@ -691,7 +760,8 @@ def main():
         train_metrics = train_epoch(
             model, train_loader, optimizer, args.device, kl_weight,
             max_context_shots=args.max_context_shots,
-            max_target_shots=args.max_target_shots
+            max_target_shots=args.max_target_shots,
+            target_chunk_size=args.target_chunk_size
         )
         train_losses.append(train_metrics['loss'])
 
