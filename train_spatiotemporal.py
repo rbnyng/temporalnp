@@ -382,10 +382,10 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
                 batch_kl += loss_dict['kl']
                 n_tiles_in_batch += 1
 
-            # Free context memory after each tile
-            del context_coords, context_embeddings, context_agbd
-            if 'cuda' in str(device):
-                torch.cuda.empty_cache()
+                # Free memory for non-chunked tiles
+                del context_coords, context_embeddings, context_agbd
+                if 'cuda' in str(device):
+                    torch.cuda.empty_cache()
 
         if n_tiles_in_batch > 0:
             # For non-chunked tiles, do the backward pass
