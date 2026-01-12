@@ -253,24 +253,66 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
                 target_agbd_cpu = target_agbd_cpu[indices]
                 n_targets = max_target_shots
 
-            # NOW move subsampled data to GPU
-            context_coords = context_coords_cpu.to(device)
-            context_embeddings = context_embeddings_cpu.to(device)
-            context_agbd = context_agbd_cpu.to(device)
+            n_context = len(context_coords_cpu)
 
-            # Process targets in chunks if still too large for memory
-            if n_targets > target_chunk_size:
+            # Use chunked processing when EITHER context OR targets are large
+            # Large context requires chunked encoding to fit in GPU memory
+            use_chunked = (n_targets > target_chunk_size) or (n_context > target_chunk_size)
+
+            if use_chunked:
                 # Chunked processing with gradient accumulation
                 tile_loss_sum = 0.0
                 tile_nll_sum = 0.0
                 tile_kl_sum = 0.0
                 valid_targets = 0
 
-                # ENCODE CONTEXT ONCE before chunk loop (major memory savings!)
-                context_encoded = model.encode_context(context_coords, context_embeddings, context_agbd)
+                # For large contexts, encode in chunks then concatenate
+                # This avoids OOM when processing 10k+ context embeddings through CNN
+                context_encoding_chunk_size = target_chunk_size
+                if n_context > context_encoding_chunk_size:
+                    # Encode context in chunks - move each chunk to GPU separately
+                    all_context_emb_features = []
+                    all_context_repr = []
 
-                # Free raw embeddings - we only need the encoded features now
-                del context_embeddings
+                    for ctx_start in range(0, n_context, context_encoding_chunk_size):
+                        ctx_end = min(ctx_start + context_encoding_chunk_size, n_context)
+
+                        # Move only this chunk to GPU
+                        chunk_coords = context_coords_cpu[ctx_start:ctx_end].to(device)
+                        chunk_embeddings = context_embeddings_cpu[ctx_start:ctx_end].to(device)
+                        chunk_agbd = context_agbd_cpu[ctx_start:ctx_end].to(device)
+
+                        chunk_emb_features, chunk_repr = model.encode_context(
+                            chunk_coords, chunk_embeddings, chunk_agbd
+                        )
+                        all_context_emb_features.append(chunk_emb_features)
+                        all_context_repr.append(chunk_repr)
+
+                        # Free chunk tensors and clear memory
+                        del chunk_coords, chunk_embeddings, chunk_agbd
+                        if 'cuda' in str(device):
+                            torch.cuda.empty_cache()
+
+                    # Concatenate all chunks
+                    context_encoded = (
+                        torch.cat(all_context_emb_features, dim=0),
+                        torch.cat(all_context_repr, dim=0)
+                    )
+                    del all_context_emb_features, all_context_repr
+
+                    # Move context coords/agbd to GPU (needed for forward pass)
+                    context_coords = context_coords_cpu.to(device)
+                    context_agbd = context_agbd_cpu.to(device)
+                else:
+                    # Context fits in memory, move all to GPU and encode at once
+                    context_coords = context_coords_cpu.to(device)
+                    context_embeddings = context_embeddings_cpu.to(device)
+                    context_agbd = context_agbd_cpu.to(device)
+                    context_encoded = model.encode_context(context_coords, context_embeddings, context_agbd)
+
+                    # Free raw embeddings
+                    del context_embeddings
+
                 if 'cuda' in str(device):
                     torch.cuda.empty_cache()
 
@@ -350,7 +392,10 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
                     n_tiles_in_batch += 1
 
             else:
-                # Standard processing for smaller tiles - move all targets to GPU
+                # Standard processing for smaller tiles - move all data to GPU
+                context_coords = context_coords_cpu.to(device)
+                context_embeddings = context_embeddings_cpu.to(device)
+                context_agbd = context_agbd_cpu.to(device)
                 target_coords = target_coords_cpu.to(device)
                 target_embeddings = target_embeddings_cpu.to(device)
                 target_agbd = target_agbd_cpu.to(device)
