@@ -111,11 +111,11 @@ def parse_args():
                         help='Buffer size in degrees for spatial CV')
     parser.add_argument('--min_shots_per_tile', type=int, default=10,
                         help='Minimum GEDI shots per tile')
-    parser.add_argument('--max_context_shots', type=int, default=20000,
+    parser.add_argument('--max_context_shots', type=int, default=5000,
                         help='Maximum context shots per tile (subsampled if exceeded for memory)')
-    parser.add_argument('--max_target_shots', type=int, default=5000,
+    parser.add_argument('--max_target_shots', type=int, default=2000,
                         help='Maximum target shots per tile (subsampled if exceeded)')
-    parser.add_argument('--target_chunk_size', type=int, default=2000,
+    parser.add_argument('--target_chunk_size', type=int, default=1000,
                         help='Process targets in chunks of this size for memory efficiency')
     parser.add_argument('--early_stopping_patience', type=int, default=25,
                         help='Early stopping patience')
@@ -260,10 +260,11 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
 
             # Process targets in chunks if still too large for memory
             if n_targets > target_chunk_size:
-                # Chunked processing - accumulate losses
-                chunk_losses = []
-                chunk_nlls = []
-                chunk_kls = []
+                # Chunked processing with gradient accumulation
+                tile_loss_sum = 0.0
+                tile_nll_sum = 0.0
+                tile_kl_sum = 0.0
+                valid_targets = 0
 
                 # Shuffle targets on CPU for chunking
                 perm = torch.randperm(n_targets)
@@ -271,8 +272,12 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
                 target_embeddings_cpu = target_embeddings_cpu[perm]
                 target_agbd_cpu = target_agbd_cpu[perm]
 
+                n_chunks = (n_targets + target_chunk_size - 1) // target_chunk_size
+
                 for chunk_start in range(0, n_targets, target_chunk_size):
                     chunk_end = min(chunk_start + target_chunk_size, n_targets)
+                    chunk_size = chunk_end - chunk_start
+
                     # Move only this chunk to GPU
                     chunk_target_coords = target_coords_cpu[chunk_start:chunk_end].to(device)
                     chunk_target_embeddings = target_embeddings_cpu[chunk_start:chunk_end].to(device)
@@ -296,20 +301,29 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
                     )
 
                     if not (torch.isnan(loss) or torch.isinf(loss)):
-                        chunk_losses.append(loss * (chunk_end - chunk_start))
-                        chunk_nlls.append(loss_dict['nll'] * (chunk_end - chunk_start))
-                        chunk_kls.append(loss_dict['kl'] * (chunk_end - chunk_start))
+                        # Scale loss by chunk weight and accumulate gradients immediately
+                        chunk_weight = chunk_size / n_targets
+                        scaled_loss = loss * chunk_weight / n_tiles_in_batch if n_tiles_in_batch > 0 else loss * chunk_weight
+                        scaled_loss.backward()
 
-                if chunk_losses:
-                    # Weighted average by chunk size
-                    tile_loss = sum(chunk_losses) / n_targets
-                    tile_nll = sum(chunk_nlls) / n_targets
-                    tile_kl = sum(chunk_kls) / n_targets
+                        # Track scalar values for logging
+                        tile_loss_sum += loss.item() * chunk_size
+                        tile_nll_sum += loss_dict['nll'] * chunk_size
+                        tile_kl_sum += loss_dict['kl'] * chunk_size
+                        valid_targets += chunk_size
 
-                    batch_loss += tile_loss
-                    batch_nll += tile_nll
-                    batch_kl += tile_kl
+                    # Free memory after each chunk
+                    del pred_mean, pred_log_var, chunk_target_coords, chunk_target_embeddings, chunk_target_agbd
+                    if 'cuda' in str(device):
+                        torch.cuda.empty_cache()
+
+                if valid_targets > 0:
+                    total_loss += tile_loss_sum / valid_targets
+                    total_nll += tile_nll_sum / valid_targets
+                    total_kl += tile_kl_sum / valid_targets
+                    n_tiles += 1
                     n_tiles_in_batch += 1
+
             else:
                 # Standard processing for smaller tiles - move all targets to GPU
                 target_coords = target_coords_cpu.to(device)
@@ -334,24 +348,31 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
                 )
 
                 if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"Warning: NaN/Inf loss detected! Skipping batch.")
+                    print(f"Warning: NaN/Inf loss detected! Skipping tile.")
                     continue
 
+                # For non-chunked tiles, accumulate loss tensor for batch backward
                 batch_loss += loss
                 batch_nll += loss_dict['nll']
                 batch_kl += loss_dict['kl']
                 n_tiles_in_batch += 1
 
+            # Free context memory after each tile
+            del context_coords, context_embeddings, context_agbd
+            if 'cuda' in str(device):
+                torch.cuda.empty_cache()
+
         if n_tiles_in_batch > 0:
-            batch_loss = batch_loss / n_tiles_in_batch
-            batch_loss.backward()
+            # For non-chunked tiles, do the backward pass
+            if batch_loss != 0:
+                batch_loss = batch_loss / n_tiles_in_batch
+                batch_loss.backward()
+                total_loss += batch_loss.item()
+                total_nll += batch_nll / n_tiles_in_batch
+                total_kl += batch_kl / n_tiles_in_batch
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-
-            total_loss += batch_loss.item()
-            total_nll += batch_nll / n_tiles_in_batch
-            total_kl += batch_kl / n_tiles_in_batch
-            n_tiles += n_tiles_in_batch
 
         # Clear cache after each batch to reduce memory fragmentation
         if 'cuda' in str(device):
