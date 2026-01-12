@@ -111,11 +111,11 @@ def parse_args():
                         help='Buffer size in degrees for spatial CV')
     parser.add_argument('--min_shots_per_tile', type=int, default=10,
                         help='Minimum GEDI shots per tile')
-    parser.add_argument('--max_context_shots', type=int, default=5000,
+    parser.add_argument('--max_context_shots', type=int, default=10000,
                         help='Maximum context shots per tile (subsampled if exceeded for memory)')
-    parser.add_argument('--max_target_shots', type=int, default=2000,
+    parser.add_argument('--max_target_shots', type=int, default=5000,
                         help='Maximum target shots per tile (subsampled if exceeded)')
-    parser.add_argument('--target_chunk_size', type=int, default=1000,
+    parser.add_argument('--target_chunk_size', type=int, default=2000,
                         help='Process targets in chunks of this size for memory efficiency')
     parser.add_argument('--early_stopping_patience', type=int, default=25,
                         help='Early stopping patience')
@@ -266,6 +266,14 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
                 tile_kl_sum = 0.0
                 valid_targets = 0
 
+                # ENCODE CONTEXT ONCE before chunk loop (major memory savings!)
+                context_encoded = model.encode_context(context_coords, context_embeddings, context_agbd)
+
+                # Free raw embeddings - we only need the encoded features now
+                del context_embeddings
+                if 'cuda' in str(device):
+                    torch.cuda.empty_cache()
+
                 # Shuffle targets on CPU for chunking
                 perm = torch.randperm(n_targets)
                 target_coords_cpu = target_coords_cpu[perm]
@@ -283,14 +291,16 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
                     chunk_target_embeddings = target_embeddings_cpu[chunk_start:chunk_end].to(device)
                     chunk_target_agbd = target_agbd_cpu[chunk_start:chunk_end].to(device)
 
+                    # Use pre-encoded context (avoids re-encoding for each chunk)
                     pred_mean, pred_log_var, z_mu_context, z_log_sigma_context, z_mu_all, z_log_sigma_all = model(
                         context_coords,
-                        context_embeddings,
+                        None,  # embeddings not needed - using context_encoded
                         context_agbd,
                         chunk_target_coords,
                         chunk_target_embeddings,
                         query_agbd=chunk_target_agbd,
-                        training=True
+                        training=True,
+                        context_encoded=context_encoded
                     )
 
                     loss, loss_dict = neural_process_loss(
@@ -316,6 +326,11 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
                     del pred_mean, pred_log_var, chunk_target_coords, chunk_target_embeddings, chunk_target_agbd
                     if 'cuda' in str(device):
                         torch.cuda.empty_cache()
+
+                # Free context encoding after all chunks processed
+                del context_encoded
+                if 'cuda' in str(device):
+                    torch.cuda.empty_cache()
 
                 if valid_targets > 0:
                     total_loss += tile_loss_sum / valid_targets
