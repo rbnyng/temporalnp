@@ -281,15 +281,25 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
                 target_agbd_cpu = target_agbd_cpu[perm]
 
                 n_chunks = (n_targets + target_chunk_size - 1) // target_chunk_size
+                chunk_idx = 0
 
                 for chunk_start in range(0, n_targets, target_chunk_size):
                     chunk_end = min(chunk_start + target_chunk_size, n_targets)
                     chunk_size = chunk_end - chunk_start
+                    is_last_chunk = (chunk_idx == n_chunks - 1)
+                    chunk_idx += 1
 
                     # Move only this chunk to GPU
                     chunk_target_coords = target_coords_cpu[chunk_start:chunk_end].to(device)
                     chunk_target_embeddings = target_embeddings_cpu[chunk_start:chunk_end].to(device)
                     chunk_target_agbd = target_agbd_cpu[chunk_start:chunk_end].to(device)
+
+                    # For non-last chunks, detach context to allow backward without freeing graph
+                    # Last chunk keeps gradients flowing through context encoder
+                    if is_last_chunk:
+                        context_for_chunk = context_encoded
+                    else:
+                        context_for_chunk = (context_encoded[0].detach(), context_encoded[1].detach())
 
                     # Use pre-encoded context (avoids re-encoding for each chunk)
                     pred_mean, pred_log_var, z_mu_context, z_log_sigma_context, z_mu_all, z_log_sigma_all = model(
@@ -300,7 +310,7 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
                         chunk_target_embeddings,
                         query_agbd=chunk_target_agbd,
                         training=True,
-                        context_encoded=context_encoded
+                        context_encoded=context_for_chunk
                     )
 
                     loss, loss_dict = neural_process_loss(
@@ -313,7 +323,7 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
                     if not (torch.isnan(loss) or torch.isinf(loss)):
                         # Scale loss by chunk weight and accumulate gradients immediately
                         chunk_weight = chunk_size / n_targets
-                        scaled_loss = loss * chunk_weight / n_tiles_in_batch if n_tiles_in_batch > 0 else loss * chunk_weight
+                        scaled_loss = loss * chunk_weight / max(n_tiles_in_batch, 1)
                         scaled_loss.backward()
 
                         # Track scalar values for logging
