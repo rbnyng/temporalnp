@@ -225,32 +225,38 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
         n_tiles_in_batch = 0
 
         for i in range(len(batch['context_coords'])):
-            context_coords = batch['context_coords'][i].to(device)
-            context_embeddings = batch['context_embeddings'][i].to(device)
-            context_agbd = batch['context_agbd'][i].to(device)
-            target_coords = batch['target_coords'][i].to(device)
-            target_embeddings = batch['target_embeddings'][i].to(device)
-            target_agbd = batch['target_agbd'][i].to(device)
+            # Keep on CPU for now - subsample before moving to GPU
+            context_coords_cpu = batch['context_coords'][i]
+            context_embeddings_cpu = batch['context_embeddings'][i]
+            context_agbd_cpu = batch['context_agbd'][i]
+            target_coords_cpu = batch['target_coords'][i]
+            target_embeddings_cpu = batch['target_embeddings'][i]
+            target_agbd_cpu = batch['target_agbd'][i]
 
-            if len(target_coords) == 0:
+            if len(target_coords_cpu) == 0:
                 continue
 
-            # Runtime subsampling of context if too large (prevents OOM in attention)
-            n_context = len(context_coords)
+            # Subsample context on CPU BEFORE moving to GPU (critical for memory)
+            n_context = len(context_coords_cpu)
             if n_context > max_context_shots:
-                indices = torch.randperm(n_context, device=device)[:max_context_shots]
-                context_coords = context_coords[indices]
-                context_embeddings = context_embeddings[indices]
-                context_agbd = context_agbd[indices]
+                indices = torch.randperm(n_context)[:max_context_shots]
+                context_coords_cpu = context_coords_cpu[indices]
+                context_embeddings_cpu = context_embeddings_cpu[indices]
+                context_agbd_cpu = context_agbd_cpu[indices]
 
-            # Runtime subsampling of targets if too large
-            n_targets = len(target_coords)
+            # Subsample targets on CPU BEFORE moving to GPU
+            n_targets = len(target_coords_cpu)
             if n_targets > max_target_shots:
-                indices = torch.randperm(n_targets, device=device)[:max_target_shots]
-                target_coords = target_coords[indices]
-                target_embeddings = target_embeddings[indices]
-                target_agbd = target_agbd[indices]
+                indices = torch.randperm(n_targets)[:max_target_shots]
+                target_coords_cpu = target_coords_cpu[indices]
+                target_embeddings_cpu = target_embeddings_cpu[indices]
+                target_agbd_cpu = target_agbd_cpu[indices]
                 n_targets = max_target_shots
+
+            # NOW move subsampled data to GPU
+            context_coords = context_coords_cpu.to(device)
+            context_embeddings = context_embeddings_cpu.to(device)
+            context_agbd = context_agbd_cpu.to(device)
 
             # Process targets in chunks if still too large for memory
             if n_targets > target_chunk_size:
@@ -259,17 +265,18 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
                 chunk_nlls = []
                 chunk_kls = []
 
-                # Shuffle targets for chunking
-                perm = torch.randperm(n_targets, device=device)
-                target_coords = target_coords[perm]
-                target_embeddings = target_embeddings[perm]
-                target_agbd = target_agbd[perm]
+                # Shuffle targets on CPU for chunking
+                perm = torch.randperm(n_targets)
+                target_coords_cpu = target_coords_cpu[perm]
+                target_embeddings_cpu = target_embeddings_cpu[perm]
+                target_agbd_cpu = target_agbd_cpu[perm]
 
                 for chunk_start in range(0, n_targets, target_chunk_size):
                     chunk_end = min(chunk_start + target_chunk_size, n_targets)
-                    chunk_target_coords = target_coords[chunk_start:chunk_end]
-                    chunk_target_embeddings = target_embeddings[chunk_start:chunk_end]
-                    chunk_target_agbd = target_agbd[chunk_start:chunk_end]
+                    # Move only this chunk to GPU
+                    chunk_target_coords = target_coords_cpu[chunk_start:chunk_end].to(device)
+                    chunk_target_embeddings = target_embeddings_cpu[chunk_start:chunk_end].to(device)
+                    chunk_target_agbd = target_agbd_cpu[chunk_start:chunk_end].to(device)
 
                     pred_mean, pred_log_var, z_mu_context, z_log_sigma_context, z_mu_all, z_log_sigma_all = model(
                         context_coords,
@@ -289,24 +296,26 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
                     )
 
                     if not (torch.isnan(loss) or torch.isinf(loss)):
-                        chunk_losses.append(loss * len(chunk_target_coords))
-                        chunk_nlls.append(loss_dict['nll'] * len(chunk_target_coords))
-                        chunk_kls.append(loss_dict['kl'] * len(chunk_target_coords))
+                        chunk_losses.append(loss * (chunk_end - chunk_start))
+                        chunk_nlls.append(loss_dict['nll'] * (chunk_end - chunk_start))
+                        chunk_kls.append(loss_dict['kl'] * (chunk_end - chunk_start))
 
                 if chunk_losses:
                     # Weighted average by chunk size
-                    total_chunk_targets = sum(len(target_coords[i:i+target_chunk_size])
-                                             for i in range(0, n_targets, target_chunk_size))
-                    tile_loss = sum(chunk_losses) / total_chunk_targets
-                    tile_nll = sum(chunk_nlls) / total_chunk_targets
-                    tile_kl = sum(chunk_kls) / total_chunk_targets
+                    tile_loss = sum(chunk_losses) / n_targets
+                    tile_nll = sum(chunk_nlls) / n_targets
+                    tile_kl = sum(chunk_kls) / n_targets
 
                     batch_loss += tile_loss
                     batch_nll += tile_nll
                     batch_kl += tile_kl
                     n_tiles_in_batch += 1
             else:
-                # Standard processing for smaller tiles
+                # Standard processing for smaller tiles - move all targets to GPU
+                target_coords = target_coords_cpu.to(device)
+                target_embeddings = target_embeddings_cpu.to(device)
+                target_agbd = target_agbd_cpu.to(device)
+
                 pred_mean, pred_log_var, z_mu_context, z_log_sigma_context, z_mu_all, z_log_sigma_all = model(
                     context_coords,
                     context_embeddings,
