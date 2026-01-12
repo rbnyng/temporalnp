@@ -500,6 +500,8 @@ class CrossYearSpatiotemporalDataset(Dataset):
         min_shots_per_tile: int = 10,
         max_shots_per_tile: Optional[int] = None,
         min_years_per_tile: int = 2,
+        max_context_shots: Optional[int] = None,
+        max_target_shots: Optional[int] = None,
         normalize_coords: bool = True,
         normalize_agbd: bool = True,
         agbd_scale: float = 200.0,
@@ -519,6 +521,8 @@ class CrossYearSpatiotemporalDataset(Dataset):
             min_shots_per_tile: Minimum shots per tile
             max_shots_per_tile: Maximum shots per tile
             min_years_per_tile: Minimum number of years required per tile (need at least 2)
+            max_context_shots: Max context shots to return (subsampled BEFORE tensor creation)
+            max_target_shots: Max target shots to return (subsampled BEFORE tensor creation)
             normalize_coords: Normalize coordinates
             normalize_agbd: Normalize AGBD
             agbd_scale: AGBD normalization scale
@@ -574,6 +578,8 @@ class CrossYearSpatiotemporalDataset(Dataset):
 
         self.min_shots_per_tile = min_shots_per_tile
         self.max_shots_per_tile = max_shots_per_tile
+        self.max_context_shots = max_context_shots
+        self.max_target_shots = max_target_shots
         self.normalize_coords = normalize_coords
         self.normalize_agbd = normalize_agbd
         self.agbd_scale = agbd_scale
@@ -590,7 +596,9 @@ class CrossYearSpatiotemporalDataset(Dataset):
             self.lon_min, self.lat_min, self.lon_max, self.lat_max = global_bounds
 
         mode = "spatiotemporal (5D)" if include_temporal else "spatial-only (2D)"
-        print(f"CrossYear dataset: {len(self.tiles)} tiles with ≥{min_years_per_tile} years, coords: {mode}")
+        ctx_limit = f", max_ctx={max_context_shots}" if max_context_shots else ""
+        tgt_limit = f", max_tgt={max_target_shots}" if max_target_shots else ""
+        print(f"CrossYear dataset: {len(self.tiles)} tiles with ≥{min_years_per_tile} years, coords: {mode}{ctx_limit}{tgt_limit}")
         print(f"  Skipped {skipped_single_year} single-year tiles")
         if len(self.tiles) > 0:
             shots_per_tile = [len(t) for t in self.tiles]
@@ -610,6 +618,7 @@ class CrossYearSpatiotemporalDataset(Dataset):
         Get a cross-year training sample.
 
         Randomly selects one year as target, uses remaining years as context.
+        Subsamples BEFORE creating numpy arrays to avoid memory issues with large tiles.
         """
         tile_data = self.tiles[idx].copy()
         tile_years = self.tile_years[idx]
@@ -635,12 +644,18 @@ class CrossYearSpatiotemporalDataset(Dataset):
             context_data = tile_data.iloc[indices[:max(1, mid)]]
             target_data = tile_data.iloc[indices[mid:]]
 
-        # Extract features for context
+        # Subsample BEFORE np.stack to avoid memory issues with large tiles
+        if self.max_context_shots and len(context_data) > self.max_context_shots:
+            context_data = context_data.sample(n=self.max_context_shots)
+        if self.max_target_shots and len(target_data) > self.max_target_shots:
+            target_data = target_data.sample(n=self.max_target_shots)
+
+        # Extract features for context (now working with subsampled data)
         context_spatial = context_data[['longitude', 'latitude']].values
         context_embeddings = np.stack(context_data['embedding_patch'].values)
         context_agbd = context_data['agbd'].values[:, None]
 
-        # Extract features for targets
+        # Extract features for targets (now working with subsampled data)
         target_spatial = target_data[['longitude', 'latitude']].values
         target_embeddings = np.stack(target_data['embedding_patch'].values)
         target_agbd = target_data['agbd'].values[:, None]

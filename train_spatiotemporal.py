@@ -457,19 +457,15 @@ def predict_on_test_df(
                 all_indices.extend(tile_indices)
                 continue
 
-            # Prepare context
+            # Subsample context BEFORE np.stack to avoid memory issues with large tiles
+            if len(tile_context) > max_context_shots:
+                tile_context = tile_context.sample(n=max_context_shots)
+
+            # Now extract features from subsampled data
             ctx_coords = tile_context[['longitude', 'latitude']].values
             ctx_embeddings = np.stack(tile_context['embedding_patch'].values)
             ctx_agbd = tile_context['agbd'].values[:, None]
             ctx_time = pd.to_datetime(tile_context['time'])
-
-            # Subsample context if too large
-            if len(ctx_coords) > max_context_shots:
-                indices = np.random.choice(len(ctx_coords), max_context_shots, replace=False)
-                ctx_coords = ctx_coords[indices]
-                ctx_embeddings = ctx_embeddings[indices]
-                ctx_agbd = ctx_agbd[indices]
-                ctx_time = ctx_time.iloc[indices]
 
             # Normalize spatial coords
             lon_min, lat_min, lon_max, lat_max = global_bounds
@@ -691,7 +687,12 @@ def main():
     if args.cross_year_training:
         print(f"  Training mode: CROSS-YEAR (context from other years, target from held-out year)")
         DatasetClass = CrossYearSpatiotemporalDataset
-        extra_args = {'min_years_per_tile': 2}
+        # Pass max_context/target_shots to subsample BEFORE np.stack (avoids OOM on large tiles)
+        extra_args = {
+            'min_years_per_tile': 2,
+            'max_context_shots': args.max_context_shots,
+            'max_target_shots': args.max_target_shots
+        }
     else:
         print(f"  Training mode: STANDARD (random context/target split within mixed years)")
         DatasetClass = GEDISpatiotemporalDataset
