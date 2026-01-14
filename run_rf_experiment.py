@@ -36,17 +36,23 @@ try:
 except ImportError:
     HAS_XGBOOST = False
 
+try:
+    from quantile_forest import RandomForestQuantileRegressor
+    HAS_QUANTILE_FOREST = True
+except ImportError:
+    HAS_QUANTILE_FOREST = False
+
+from scipy.stats import norm
+
 from data.gedi import GEDIQuerier
 
 
 class QuantileRandomForest:
     """
-    Proper Quantile Random Forest implementation.
+    Quantile Regression Forest wrapper using the quantile-forest package.
 
-    Uses leaf value caching: for each tree, stores all training targets
-    that fall into each leaf, then computes quantiles at prediction time.
-
-    This is the standard approach from Meinshausen (2006) "Quantile Regression Forests".
+    Uses the proper QRF implementation from Meinshausen (2006) which stores
+    all leaf values during training for exact conditional quantile estimation.
     """
 
     def __init__(
@@ -56,106 +62,78 @@ class QuantileRandomForest:
         min_samples_leaf: int = 5,
         n_jobs: int = -1,
         random_state: int = 42,
-        quantiles: Tuple[float, ...] = (0.159, 0.5, 0.841)  # 1-sigma coverage
+        default_quantiles: Tuple[float, float] = (0.025, 0.975)
     ):
+        if not HAS_QUANTILE_FOREST:
+            raise ImportError(
+                "quantile-forest package not installed. "
+                "Install with: pip install quantile-forest"
+            )
+
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.min_samples_leaf = min_samples_leaf
         self.n_jobs = n_jobs
         self.random_state = random_state
-        self.quantiles = quantiles
+        self.default_quantiles = default_quantiles
 
-        self.forest = RandomForestRegressor(
+        self.model = RandomForestQuantileRegressor(
             n_estimators=n_estimators,
             max_depth=max_depth,
             min_samples_leaf=min_samples_leaf,
             n_jobs=n_jobs,
-            random_state=random_state,
-            verbose=0
+            random_state=random_state
         )
-        self.leaf_values: List[Dict[int, np.ndarray]] = []
 
     def fit(self, X: np.ndarray, y: np.ndarray):
-        """Fit the forest and cache leaf values for quantile prediction."""
+        """Fit the quantile regression forest."""
         y = np.asarray(y).ravel()
-        self.forest.fit(X, y)
-
-        # For each tree, find which leaf each training sample falls into
-        # and store the y values per leaf
-        self.leaf_values = []
-
-        for tree in tqdm(self.forest.estimators_, desc="Caching leaf values", leave=False):
-            # Get leaf indices for all training samples
-            leaf_indices = tree.apply(X)
-
-            # Group y values by leaf
-            leaf_dict: Dict[int, List[float]] = {}
-            for idx, leaf_id in enumerate(leaf_indices):
-                if leaf_id not in leaf_dict:
-                    leaf_dict[leaf_id] = []
-                leaf_dict[leaf_id].append(y[idx])
-
-            # Convert lists to arrays
-            leaf_arrays = {k: np.array(v) for k, v in leaf_dict.items()}
-            self.leaf_values.append(leaf_arrays)
-
+        self.model.fit(X, y)
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Return median prediction."""
-        return self.predict_quantiles(X, quantiles=[0.5])[:, 0]
+        return self.model.predict(X, quantiles=0.5)
+
+    def predict_with_std(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Predict with standard deviation estimate from quantile range.
+
+        Returns:
+            (predictions, std) where std is estimated from quantile range
+        """
+        # Predict median as point estimate
+        predictions = self.model.predict(X, quantiles=0.5)
+
+        # Use default quantiles to estimate std
+        lower_q, upper_q = self.default_quantiles
+        quantile_preds = self.model.predict(X, quantiles=[lower_q, upper_q])
+        lower = quantile_preds[:, 0]
+        upper = quantile_preds[:, 1]
+
+        # Approximate std from quantile range using normal distribution z-scores
+        z_upper = norm.ppf(upper_q)
+        z_lower = norm.ppf(lower_q)
+        std = (upper - lower) / (z_upper - z_lower)
+
+        return predictions, std
 
     def predict_quantiles(
         self,
         X: np.ndarray,
-        quantiles: Optional[List[float]] = None
+        quantiles: List[float]
     ) -> np.ndarray:
         """
-        Predict quantiles for each sample.
+        Predict specific quantiles.
 
         Args:
             X: Features (n_samples, n_features)
-            quantiles: List of quantiles to predict (default: self.quantiles)
+            quantiles: List of quantiles to predict
 
         Returns:
-            Predictions of shape (n_samples, n_quantiles)
+            (n_samples, n_quantiles) array of predictions
         """
-        if quantiles is None:
-            quantiles = list(self.quantiles)
-
-        n_samples = X.shape[0]
-        n_quantiles = len(quantiles)
-
-        # Collect all leaf values for each sample across all trees
-        all_predictions = np.zeros((n_samples, n_quantiles))
-
-        # Process in batches to avoid memory issues
-        batch_size = 1000
-        for batch_start in range(0, n_samples, batch_size):
-            batch_end = min(batch_start + batch_size, n_samples)
-            X_batch = X[batch_start:batch_end]
-            batch_n = batch_end - batch_start
-
-            # Collect values from all trees for this batch
-            sample_values: List[List[float]] = [[] for _ in range(batch_n)]
-
-            for tree_idx, tree in enumerate(self.forest.estimators_):
-                leaf_indices = tree.apply(X_batch)
-                leaf_dict = self.leaf_values[tree_idx]
-
-                for sample_idx, leaf_id in enumerate(leaf_indices):
-                    if leaf_id in leaf_dict:
-                        sample_values[sample_idx].extend(leaf_dict[leaf_id].tolist())
-
-            # Compute quantiles for each sample
-            for sample_idx in range(batch_n):
-                if sample_values[sample_idx]:
-                    vals = np.array(sample_values[sample_idx])
-                    all_predictions[batch_start + sample_idx] = np.percentile(
-                        vals, [q * 100 for q in quantiles]
-                    )
-
-        return all_predictions
+        return self.model.predict(X, quantiles=quantiles)
 
 
 class QuantileXGBoost:
@@ -420,15 +398,15 @@ def train_rf_model(
         model.fit(X_train, y_train.ravel())
 
     elif model_type == 'quantile_rf':
-        # Proper Quantile RF using leaf value caching (Meinshausen 2006)
-        # Quantiles: 0.159 and 0.841 give ~68% coverage (1-sigma)
+        # Proper Quantile RF using quantile-forest package (Meinshausen 2006)
+        # Default quantiles (0.025, 0.975) for 95% prediction interval -> std estimation
         model = QuantileRandomForest(
             n_estimators=n_estimators,
             max_depth=max_depth,
             min_samples_leaf=min_samples_leaf,
             n_jobs=n_jobs,
             random_state=random_state,
-            quantiles=(0.159, 0.5, 0.841)
+            default_quantiles=(0.025, 0.975)
         )
         model.fit(X_train, y_train.ravel())
 
@@ -490,12 +468,9 @@ def predict_with_uncertainty(
         uncertainties = tree_predictions.std(axis=0)
 
     elif model_type == 'quantile_rf':
-        # Proper quantile-based uncertainty
-        # Model trained with quantiles (0.159, 0.5, 0.841) for 1-sigma coverage
-        quantile_preds = model.predict_quantiles(X, quantiles=[0.159, 0.5, 0.841])
-        predictions = quantile_preds[:, 1]  # Median
-        # Uncertainty as half the interquartile range (approximates std for normal)
-        uncertainties = (quantile_preds[:, 2] - quantile_preds[:, 0]) / 2.0
+        # Proper quantile-based uncertainty using quantile-forest package
+        # Uses default_quantiles (0.025, 0.975) to estimate std via z-scores
+        predictions, uncertainties = model.predict_with_std(X)
 
     elif model_type == 'xgb':
         predictions = model.predict(X)
