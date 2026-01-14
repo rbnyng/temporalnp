@@ -45,6 +45,20 @@ except ImportError:
 from scipy.stats import norm
 
 from data.gedi import GEDIQuerier
+from data.embeddings import EmbeddingExtractor
+from data.dataset import compute_temporal_encoding
+from data.spatial_cv import SpatiotemporalSplitter
+from utils.config import save_config, _make_serializable
+from utils.evaluation import compute_calibration_metrics
+from utils.normalization import normalize_coords, normalize_agbd, denormalize_agbd
+from utils.disturbance import (
+    compute_disturbance_analysis,
+    print_disturbance_analysis,
+    print_stratified_r2,
+    aggregate_stratified_r2,
+    print_aggregated_stratified_r2,
+    compute_pooled_stratified_r2
+)
 
 
 class QuantileRandomForest:
@@ -216,20 +230,6 @@ class QuantileXGBoost:
             predictions[:, i] = self.models[q].predict(X)
 
         return predictions
-from data.embeddings import EmbeddingExtractor
-from data.dataset import compute_temporal_encoding
-from data.spatial_cv import SpatiotemporalSplitter
-from utils.config import save_config, _make_serializable
-from utils.evaluation import compute_calibration_metrics
-from utils.normalization import normalize_coords, normalize_agbd, denormalize_agbd
-from utils.disturbance import (
-    compute_disturbance_analysis,
-    print_disturbance_analysis,
-    print_stratified_r2,
-    aggregate_stratified_r2,
-    print_aggregated_stratified_r2,
-    compute_pooled_stratified_r2
-)
 
 
 def parse_args():
