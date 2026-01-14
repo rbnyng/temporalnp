@@ -37,6 +37,207 @@ except ImportError:
     HAS_XGBOOST = False
 
 from data.gedi import GEDIQuerier
+
+
+class QuantileRandomForest:
+    """
+    Proper Quantile Random Forest implementation.
+
+    Uses leaf value caching: for each tree, stores all training targets
+    that fall into each leaf, then computes quantiles at prediction time.
+
+    This is the standard approach from Meinshausen (2006) "Quantile Regression Forests".
+    """
+
+    def __init__(
+        self,
+        n_estimators: int = 100,
+        max_depth: Optional[int] = None,
+        min_samples_leaf: int = 5,
+        n_jobs: int = -1,
+        random_state: int = 42,
+        quantiles: Tuple[float, ...] = (0.159, 0.5, 0.841)  # 1-sigma coverage
+    ):
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.min_samples_leaf = min_samples_leaf
+        self.n_jobs = n_jobs
+        self.random_state = random_state
+        self.quantiles = quantiles
+
+        self.forest = RandomForestRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            min_samples_leaf=min_samples_leaf,
+            n_jobs=n_jobs,
+            random_state=random_state,
+            verbose=0
+        )
+        self.leaf_values: List[Dict[int, np.ndarray]] = []
+
+    def fit(self, X: np.ndarray, y: np.ndarray):
+        """Fit the forest and cache leaf values for quantile prediction."""
+        y = np.asarray(y).ravel()
+        self.forest.fit(X, y)
+
+        # For each tree, find which leaf each training sample falls into
+        # and store the y values per leaf
+        self.leaf_values = []
+
+        for tree in tqdm(self.forest.estimators_, desc="Caching leaf values", leave=False):
+            # Get leaf indices for all training samples
+            leaf_indices = tree.apply(X)
+
+            # Group y values by leaf
+            leaf_dict: Dict[int, List[float]] = {}
+            for idx, leaf_id in enumerate(leaf_indices):
+                if leaf_id not in leaf_dict:
+                    leaf_dict[leaf_id] = []
+                leaf_dict[leaf_id].append(y[idx])
+
+            # Convert lists to arrays
+            leaf_arrays = {k: np.array(v) for k, v in leaf_dict.items()}
+            self.leaf_values.append(leaf_arrays)
+
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Return median prediction."""
+        return self.predict_quantiles(X, quantiles=[0.5])[:, 0]
+
+    def predict_quantiles(
+        self,
+        X: np.ndarray,
+        quantiles: Optional[List[float]] = None
+    ) -> np.ndarray:
+        """
+        Predict quantiles for each sample.
+
+        Args:
+            X: Features (n_samples, n_features)
+            quantiles: List of quantiles to predict (default: self.quantiles)
+
+        Returns:
+            Predictions of shape (n_samples, n_quantiles)
+        """
+        if quantiles is None:
+            quantiles = list(self.quantiles)
+
+        n_samples = X.shape[0]
+        n_quantiles = len(quantiles)
+
+        # Collect all leaf values for each sample across all trees
+        all_predictions = np.zeros((n_samples, n_quantiles))
+
+        # Process in batches to avoid memory issues
+        batch_size = 1000
+        for batch_start in range(0, n_samples, batch_size):
+            batch_end = min(batch_start + batch_size, n_samples)
+            X_batch = X[batch_start:batch_end]
+            batch_n = batch_end - batch_start
+
+            # Collect values from all trees for this batch
+            sample_values: List[List[float]] = [[] for _ in range(batch_n)]
+
+            for tree_idx, tree in enumerate(self.forest.estimators_):
+                leaf_indices = tree.apply(X_batch)
+                leaf_dict = self.leaf_values[tree_idx]
+
+                for sample_idx, leaf_id in enumerate(leaf_indices):
+                    if leaf_id in leaf_dict:
+                        sample_values[sample_idx].extend(leaf_dict[leaf_id].tolist())
+
+            # Compute quantiles for each sample
+            for sample_idx in range(batch_n):
+                if sample_values[sample_idx]:
+                    vals = np.array(sample_values[sample_idx])
+                    all_predictions[batch_start + sample_idx] = np.percentile(
+                        vals, [q * 100 for q in quantiles]
+                    )
+
+        return all_predictions
+
+
+class QuantileXGBoost:
+    """
+    Quantile XGBoost implementation using native quantile regression.
+
+    Trains separate models for each quantile using XGBoost's built-in
+    quantile loss function (reg:quantileerror).
+    """
+
+    def __init__(
+        self,
+        n_estimators: int = 100,
+        max_depth: int = 6,
+        learning_rate: float = 0.1,
+        min_child_weight: int = 5,
+        n_jobs: int = -1,
+        random_state: int = 42,
+        quantiles: Tuple[float, ...] = (0.159, 0.5, 0.841)
+    ):
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.learning_rate = learning_rate
+        self.min_child_weight = min_child_weight
+        self.n_jobs = n_jobs
+        self.random_state = random_state
+        self.quantiles = quantiles
+
+        self.models: Dict[float, xgb.XGBRegressor] = {}
+
+    def fit(self, X: np.ndarray, y: np.ndarray):
+        """Fit a separate model for each quantile."""
+        y = np.asarray(y).ravel()
+
+        for q in tqdm(self.quantiles, desc="Training quantile models"):
+            model = xgb.XGBRegressor(
+                n_estimators=self.n_estimators,
+                max_depth=self.max_depth,
+                learning_rate=self.learning_rate,
+                min_child_weight=self.min_child_weight,
+                n_jobs=self.n_jobs,
+                random_state=self.random_state,
+                objective='reg:quantileerror',
+                quantile_alpha=q,
+                verbosity=0
+            )
+            model.fit(X, y)
+            self.models[q] = model
+
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Return median prediction."""
+        return self.models[0.5].predict(X)
+
+    def predict_quantiles(
+        self,
+        X: np.ndarray,
+        quantiles: Optional[List[float]] = None
+    ) -> np.ndarray:
+        """
+        Predict quantiles for each sample.
+
+        Args:
+            X: Features (n_samples, n_features)
+            quantiles: List of quantiles to predict (must be subset of trained quantiles)
+
+        Returns:
+            Predictions of shape (n_samples, n_quantiles)
+        """
+        if quantiles is None:
+            quantiles = list(self.quantiles)
+
+        n_samples = X.shape[0]
+        predictions = np.zeros((n_samples, len(quantiles)))
+
+        for i, q in enumerate(quantiles):
+            if q not in self.models:
+                raise ValueError(f"Quantile {q} not trained. Available: {list(self.models.keys())}")
+            predictions[:, i] = self.models[q].predict(X)
+
+        return predictions
 from data.embeddings import EmbeddingExtractor
 from data.dataset import compute_temporal_encoding
 from data.spatial_cv import SpatiotemporalSplitter
@@ -70,8 +271,8 @@ def parse_args():
 
     # Model arguments
     parser.add_argument('--model', type=str, default='rf',
-                        choices=['rf', 'xgb', 'quantile_rf'],
-                        help='Model type: rf (Random Forest), xgb (XGBoost), quantile_rf (Quantile RF)')
+                        choices=['rf', 'xgb', 'quantile_rf', 'quantile_xgb'],
+                        help='Model type: rf (Random Forest), xgb (XGBoost), quantile_rf (Quantile RF), quantile_xgb (Quantile XGBoost)')
     parser.add_argument('--n_estimators', type=int, default=100,
                         help='Number of trees/estimators')
     parser.add_argument('--max_depth', type=int, default=6,
@@ -197,7 +398,7 @@ def train_rf_model(
     Args:
         X_train: Training features
         y_train: Training targets
-        model_type: 'rf', 'xgb', or 'quantile_rf'
+        model_type: 'rf', 'xgb', 'quantile_rf', or 'quantile_xgb'
         n_estimators: Number of trees
         max_depth: Maximum tree depth
         min_samples_leaf: Minimum samples per leaf
@@ -219,15 +420,15 @@ def train_rf_model(
         model.fit(X_train, y_train.ravel())
 
     elif model_type == 'quantile_rf':
-        # Quantile RF for uncertainty estimation
-        # We'll use a simple approach: train the RF and use tree predictions for UQ
-        model = RandomForestRegressor(
+        # Proper Quantile RF using leaf value caching (Meinshausen 2006)
+        # Quantiles: 0.159 and 0.841 give ~68% coverage (1-sigma)
+        model = QuantileRandomForest(
             n_estimators=n_estimators,
             max_depth=max_depth,
             min_samples_leaf=min_samples_leaf,
             n_jobs=n_jobs,
             random_state=random_state,
-            verbose=0
+            quantiles=(0.159, 0.5, 0.841)
         )
         model.fit(X_train, y_train.ravel())
 
@@ -245,6 +446,21 @@ def train_rf_model(
         )
         model.fit(X_train, y_train.ravel())
 
+    elif model_type == 'quantile_xgb':
+        if not HAS_XGBOOST:
+            raise ImportError("XGBoost not installed. Install with: pip install xgboost")
+        # Proper Quantile XGBoost using native quantile regression
+        model = QuantileXGBoost(
+            n_estimators=n_estimators,
+            max_depth=max_depth if max_depth else 6,
+            learning_rate=0.1,
+            min_child_weight=min_samples_leaf,
+            n_jobs=n_jobs,
+            random_state=random_state,
+            quantiles=(0.159, 0.5, 0.841)
+        )
+        model.fit(X_train, y_train.ravel())
+
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
@@ -259,23 +475,40 @@ def predict_with_uncertainty(
     """
     Generate predictions with uncertainty estimates.
 
-    For RF/quantile_rf: Use tree predictions variance
-    For XGBoost: Use a simple variance estimate (less reliable)
+    For RF: Use tree predictions variance (ensemble disagreement)
+    For quantile_rf: Use proper quantile predictions (lower/upper quantiles)
+    For XGBoost: Use tree predictions variance
+    For quantile_xgb: Use proper quantile predictions
 
     Returns:
-        (predictions, uncertainties)
+        (predictions, uncertainties) where uncertainty is standard deviation estimate
     """
-    if model_type in ['rf', 'quantile_rf']:
-        # Get predictions from all trees
+    if model_type == 'rf':
+        # Get predictions from all trees - use ensemble disagreement
         tree_predictions = np.array([tree.predict(X) for tree in model.estimators_])
         predictions = tree_predictions.mean(axis=0)
         uncertainties = tree_predictions.std(axis=0)
 
+    elif model_type == 'quantile_rf':
+        # Proper quantile-based uncertainty
+        # Model trained with quantiles (0.159, 0.5, 0.841) for 1-sigma coverage
+        quantile_preds = model.predict_quantiles(X, quantiles=[0.159, 0.5, 0.841])
+        predictions = quantile_preds[:, 1]  # Median
+        # Uncertainty as half the interquartile range (approximates std for normal)
+        uncertainties = (quantile_preds[:, 2] - quantile_preds[:, 0]) / 2.0
+
     elif model_type == 'xgb':
         predictions = model.predict(X)
-        # Simple heuristic: use feature-based uncertainty (not great, but something)
-        # Better approach would be to use XGBoost quantile regression
-        uncertainties = np.ones_like(predictions) * np.std(predictions) * 0.1
+        # For standard XGB, we don't have good uncertainty estimates
+        # Use a constant relative uncertainty based on training residuals
+        # This is a placeholder - users should use quantile_xgb for proper UQ
+        uncertainties = np.abs(predictions) * 0.2  # 20% relative uncertainty
+
+    elif model_type == 'quantile_xgb':
+        # Proper quantile-based uncertainty from native XGBoost quantile regression
+        quantile_preds = model.predict_quantiles(X, quantiles=[0.159, 0.5, 0.841])
+        predictions = quantile_preds[:, 1]  # Median
+        uncertainties = (quantile_preds[:, 2] - quantile_preds[:, 0]) / 2.0
 
     else:
         predictions = model.predict(X)
@@ -536,7 +769,8 @@ def main():
     model_names = {
         'rf': 'Random Forest',
         'xgb': 'XGBoost',
-        'quantile_rf': 'Quantile Random Forest'
+        'quantile_rf': 'Quantile Random Forest',
+        'quantile_xgb': 'Quantile XGBoost'
     }
 
     print("=" * 80)
