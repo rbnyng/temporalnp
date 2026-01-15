@@ -22,8 +22,8 @@ from data.dataset import compute_temporal_encoding
 def parse_args():
     parser = argparse.ArgumentParser(description='Inspect GEDI data')
     parser.add_argument('--region_bbox', type=float, nargs=4,
-                        default=[-122.5, 40.5, -121.5, 41.5],
-                        help='Region bounding box (default: McFarland Fire area)')
+                        default=[-73, 2, -72, 3],
+                        help='Region bounding box')
     parser.add_argument('--cache_dir', type=str, default='./cache')
     parser.add_argument('--embeddings_dir', type=str, default='./embeddings')
     parser.add_argument('--start_year', type=int, default=2019)
