@@ -618,10 +618,12 @@ def main():
     # UQ calibration metrics (in log space)
     calibration = compute_calibration_metrics(valid_pred_log, valid_target_log, valid_unc_log)
 
-    # Disturbance analysis (using shared utility)
+    # Disturbance analysis (using shared utility, log-space for stratified R²)
     disturbance_analysis = compute_disturbance_analysis(
         gedi_df, test_df, args.pre_years, args.post_years, args.test_year,
-        predictions=pred_final_linear
+        predictions=pred_final_linear,
+        predictions_log=pred_final,
+        targets_log=target_log
     )
 
     print("\n" + "=" * 80)

@@ -396,21 +396,26 @@ def run_single_seed(
     pre_years = [y for y in args.train_years if y < args.test_year]
     post_years = [y for y in args.train_years if y > args.test_year]
 
-    # Disturbance analysis
+    # Disturbance analysis (log-space for stratified R², consistent with training)
     disturbance_analysis = compute_disturbance_analysis(
         gedi_df, test_df, pre_years, post_years, args.test_year,
-        predictions=pred_linear
+        predictions=pred_linear,
+        predictions_log=pred_log,
+        targets_log=y_test_log.ravel()
     )
 
     # Save model
     with open(seed_output_dir / 'model.pkl', 'wb') as f:
         pickle.dump(model, f)
 
-    # Save predictions
+    # Save predictions (both linear and log space)
     test_df_out = test_df[['latitude', 'longitude', 'agbd', 'time', 'tile_id']].copy()
     test_df_out['pred'] = pred_linear
     test_df_out['unc'] = unc_linear
     test_df_out['residual'] = y_test_linear - pred_linear
+    # Log-space values for stratified metrics (consistent with training)
+    test_df_out['pred_log'] = pred_log
+    test_df_out['agbd_log'] = y_test_log.ravel()
     test_df_out.to_parquet(seed_output_dir / 'test_predictions.parquet')
 
     # Save tile disturbance

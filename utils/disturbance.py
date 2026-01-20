@@ -15,7 +15,9 @@ def compute_disturbance_analysis(
     pre_years: List[int],
     post_years: List[int],
     test_year: int,
-    predictions: Optional[np.ndarray] = None
+    predictions: Optional[np.ndarray] = None,
+    predictions_log: Optional[np.ndarray] = None,
+    targets_log: Optional[np.ndarray] = None
 ) -> dict:
     """
     Compute per-tile disturbance metrics and optionally stratified R².
@@ -29,7 +31,9 @@ def compute_disturbance_analysis(
         pre_years: Years before the event
         post_years: Years after the event
         test_year: The held-out test year
-        predictions: Optional predictions aligned with test_df for error analysis
+        predictions: Optional predictions (linear space) aligned with test_df for error analysis
+        predictions_log: Optional log-space predictions for stratified R² (consistent with training)
+        targets_log: Optional log-space targets for stratified R² (consistent with training)
 
     Returns:
         Dictionary with per_tile stats, correlation, quartile_rmse,
@@ -107,9 +111,14 @@ def compute_disturbance_analysis(
     valid_mask = ~tile_df['disturbance'].isna()
 
     # Compute stratified R² if predictions are provided
+    # Use log-space values if available (consistent with training)
     stratified_r2 = None
     if predictions is not None:
-        stratified_r2 = compute_stratified_r2(test_df, predictions, tile_df)
+        stratified_r2 = compute_stratified_r2(
+            test_df, predictions, tile_df,
+            predictions_log=predictions_log,
+            targets_log=targets_log
+        )
 
     # Compute correlation between disturbance and error (if predictions provided)
     correlation = {'pearson_r': None, 'p_value': None}
@@ -161,7 +170,9 @@ def compute_stratified_r2(
     test_df: pd.DataFrame,
     predictions: np.ndarray,
     tile_df: pd.DataFrame,
-    thresholds: dict = None
+    thresholds: dict = None,
+    predictions_log: Optional[np.ndarray] = None,
+    targets_log: Optional[np.ndarray] = None
 ) -> dict:
     """
     Compute R² separately for stable forest vs disturbed tiles.
@@ -173,9 +184,11 @@ def compute_stratified_r2(
 
     Args:
         test_df: Test DataFrame with tile_id and agbd columns
-        predictions: Predictions aligned with test_df
+        predictions: Predictions (linear space) aligned with test_df
         tile_df: DataFrame with tile_id and disturbance columns
         thresholds: Optional dict with 'stable_max' and 'disturbed_min' keys
+        predictions_log: Optional log-space predictions (consistent with training)
+        targets_log: Optional log-space targets (consistent with training)
 
     Returns:
         Dictionary with r2, rmse, n_shots, n_tiles for each stratum
@@ -200,20 +213,24 @@ def compute_stratified_r2(
     moderate_mask = ((test_disturbance >= stable_max) & (test_disturbance <= disturbed_min) & (~test_disturbance.isna())).values
     disturbed_mask = ((test_disturbance > disturbed_min) & (~test_disturbance.isna())).values
 
+    # Use log-space values if provided (consistent with training)
+    use_log_space = predictions_log is not None and targets_log is not None
+    preds_to_use = predictions_log if use_log_space else predictions
+    targets_to_use = targets_log if use_log_space else test_df['agbd'].values
+
     results = {
         'stable': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
         'moderate': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
         'disturbed': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
-        'thresholds': thresholds
+        'thresholds': thresholds,
+        'log_space': use_log_space
     }
-
-    targets = test_df['agbd'].values
 
     def compute_stratum_metrics(mask, stratum_name):
         if mask.sum() < 10:
             return None
-        stratum_preds = predictions[mask]
-        stratum_targets = targets[mask]
+        stratum_preds = preds_to_use[mask]
+        stratum_targets = targets_to_use[mask]
         valid = ~np.isnan(stratum_preds)
         if valid.sum() < 10:
             return None
@@ -459,25 +476,32 @@ def compute_pooled_stratified_r2(
     moderate_mask = (pooled_df['disturbance'] >= stable_max) & (pooled_df['disturbance'] <= disturbed_min) & (~pooled_df['disturbance'].isna())
     disturbed_mask = (pooled_df['disturbance'] > disturbed_min) & (~pooled_df['disturbance'].isna())
 
+    # Use log-space columns if available (consistent with training)
+    use_log_space = 'pred_log' in pooled_df.columns and 'agbd_log' in pooled_df.columns
+
     results = {
         'stable': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
         'moderate': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
         'disturbed': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
         'thresholds': thresholds,
         'pooled': True,
+        'log_space': use_log_space,
         'total_tiles': len(tile_df),
         'total_shots': len(pooled_df)
     }
+
+    pred_col = 'pred_log' if use_log_space else 'pred'
+    target_col = 'agbd_log' if use_log_space else 'agbd'
 
     def compute_stratum(mask, name):
         subset = pooled_df[mask]
         if len(subset) < 10:
             return None
-        valid = ~subset['pred'].isna()
+        valid = ~subset[pred_col].isna()
         if valid.sum() < 10:
             return None
-        preds = subset.loc[valid, 'pred'].values
-        targets = subset.loc[valid, 'agbd'].values
+        preds = subset.loc[valid, pred_col].values
+        targets = subset.loc[valid, target_col].values
         r2 = r2_score(targets, preds)
         rmse = np.sqrt(np.mean((preds - targets) ** 2))
         return {

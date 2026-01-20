@@ -982,7 +982,7 @@ def main():
             print(f"    Coverage 3σ:  {test_metrics.get('coverage_3sigma', 0):.1f}% (ideal: 99.7%)")
 
     # Generate predictions with shot-level mapping for stratified analysis
-    from utils.normalization import denormalize_agbd
+    from utils.normalization import denormalize_agbd, normalize_agbd
 
     if args.temporal_context:
         # Use train years as context for true temporal prediction
@@ -1017,10 +1017,13 @@ def main():
     pre_years = [y for y in args.train_years if y < args.test_year]
     post_years = [y for y in args.train_years if y > args.test_year]
 
-    # Compute disturbance analysis with predictions for stratified R²
+    # Compute disturbance analysis with predictions for stratified R² (log-space, consistent with training)
+    targets_log = normalize_agbd(test_df['agbd'].values)
     disturbance_analysis = compute_disturbance_analysis(
         gedi_df, test_df, pre_years, post_years, args.test_year,
-        predictions=test_preds_linear
+        predictions=test_preds_linear,
+        predictions_log=test_preds_log,
+        targets_log=targets_log
     )
 
     # Print disturbance analysis using shared utility
@@ -1034,11 +1037,14 @@ def main():
     tile_disturbance_df = pd.DataFrame(disturbance_analysis['per_tile'])
     tile_disturbance_df.to_parquet(output_dir / 'tile_disturbance.parquet')
 
-    # Save predictions for analysis
+    # Save predictions for analysis (both linear and log space)
     test_df_out = test_df[['latitude', 'longitude', 'agbd', 'time', 'tile_id']].copy()
     test_df_out['pred'] = test_preds_linear
     test_df_out['unc'] = denormalize_agbd(test_unc_log) if test_unc_log is not None else np.nan
     test_df_out['residual'] = test_df['agbd'].values - test_preds_linear
+    # Log-space values for stratified metrics (consistent with training)
+    test_df_out['pred_log'] = test_preds_log
+    test_df_out['agbd_log'] = normalize_agbd(test_df['agbd'].values)
     test_df_out.to_parquet(output_dir / 'test_predictions.parquet')
 
     # Save final results
