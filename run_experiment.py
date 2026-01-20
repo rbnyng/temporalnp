@@ -66,8 +66,8 @@ def parse_args():
                         help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=16,
                         help='Batch size')
-    parser.add_argument('--max_context_shots', type=int, default=1024,
-                        help='Maximum context shots per tile (runtime subsampling)')
+    parser.add_argument('--max_context_shots', type=int, default=10000,
+                        help='Maximum context shots per tile (chunked if needed)')
     parser.add_argument('--max_target_shots', type=int, default=1024,
                         help='Maximum target shots per tile (runtime subsampling)')
     parser.add_argument('--no_temporal_encoding', action='store_true',
