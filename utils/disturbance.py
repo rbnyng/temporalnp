@@ -15,16 +15,16 @@ def compute_disturbance_analysis(
     pre_years: List[int],
     post_years: List[int],
     test_year: int,
-    predictions: Optional[np.ndarray] = None,
-    predictions_log: Optional[np.ndarray] = None,
-    targets_log: Optional[np.ndarray] = None,
-    uncertainties_log: Optional[np.ndarray] = None
+    predictions: Optional[np.ndarray] = None
 ) -> dict:
     """
-    Compute per-tile disturbance metrics and optionally stratified R².
+    Compute per-tile disturbance metrics.
 
     Disturbance intensity = (expected - observed) / expected
     where expected = (pre_mean + post_mean) / 2, or just pre_mean if no post.
+
+    Note: For stratified metrics by disturbance level, use compute_pooled_stratified_r2()
+    after running experiments across seeds.
 
     Args:
         gedi_df: Full GEDI DataFrame with all years
@@ -33,13 +33,9 @@ def compute_disturbance_analysis(
         post_years: Years after the event
         test_year: The held-out test year
         predictions: Optional predictions (linear space) aligned with test_df for error analysis
-        predictions_log: Optional log-space predictions for stratified R² (consistent with training)
-        targets_log: Optional log-space targets for stratified R² (consistent with training)
-        uncertainties_log: Optional log-space uncertainties for coverage computation
 
     Returns:
-        Dictionary with per_tile stats, correlation, quartile_rmse,
-        stratified_r2, and summary statistics.
+        Dictionary with per_tile stats, correlation, quartile_rmse, and summary statistics.
     """
     from scipy import stats
 
@@ -112,17 +108,6 @@ def compute_disturbance_analysis(
     # Summary statistics
     valid_mask = ~tile_df['disturbance'].isna()
 
-    # Compute stratified R² if predictions are provided
-    # Use log-space values if available (consistent with training)
-    stratified_r2 = None
-    if predictions is not None:
-        stratified_r2 = compute_stratified_r2(
-            test_df, predictions, tile_df,
-            predictions_log=predictions_log,
-            targets_log=targets_log,
-            uncertainties_log=uncertainties_log
-        )
-
     # Compute correlation between disturbance and error (if predictions provided)
     correlation = {'pearson_r': None, 'p_value': None}
     quartile_rmse = {}
@@ -162,9 +147,6 @@ def compute_disturbance_analysis(
             'mean_change_from_pre': float(tile_df['change_from_pre'].mean()) if valid_mask.any() else None
         }
     }
-
-    if stratified_r2 is not None:
-        result['stratified_r2'] = stratified_r2
 
     return result
 

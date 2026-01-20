@@ -44,8 +44,7 @@ from utils.config import save_config, _make_serializable
 from utils.evaluation import evaluate_model
 from utils.disturbance import (
     compute_disturbance_analysis,
-    print_disturbance_analysis,
-    print_stratified_r2
+    print_disturbance_analysis
 )
 
 
@@ -1017,22 +1016,14 @@ def main():
     pre_years = [y for y in args.train_years if y < args.test_year]
     post_years = [y for y in args.train_years if y > args.test_year]
 
-    # Compute disturbance analysis with predictions for stratified R² (log-space, consistent with training)
-    targets_log = normalize_agbd(test_df['agbd'].values)
+    # Compute disturbance analysis
     disturbance_analysis = compute_disturbance_analysis(
         gedi_df, test_df, pre_years, post_years, args.test_year,
-        predictions=test_preds_linear,
-        predictions_log=test_preds_log,
-        targets_log=targets_log,
-        uncertainties_log=test_unc_log
+        predictions=test_preds_linear
     )
 
     # Print disturbance analysis using shared utility
     print_disturbance_analysis(disturbance_analysis, indent="    ")
-
-    # Print stratified R² using shared utility
-    if 'stratified_r2' in disturbance_analysis:
-        print_stratified_r2(disturbance_analysis['stratified_r2'], indent="    ")
 
     # Save per-tile disturbance analysis
     tile_disturbance_df = pd.DataFrame(disturbance_analysis['per_tile'])
@@ -1070,8 +1061,6 @@ def main():
             'summary': disturbance_analysis['summary']
         }
     }
-    if 'stratified_r2' in disturbance_analysis:
-        results['stratified_r2'] = disturbance_analysis['stratified_r2']
 
     with open(output_dir / 'results.json', 'w') as f:
         json.dump(_make_serializable(results), f, indent=2)

@@ -33,8 +33,7 @@ from utils.evaluation import evaluate_model, compute_calibration_metrics
 from utils.normalization import normalize_coords, normalize_agbd, denormalize_agbd, denormalize_std
 from utils.disturbance import (
     compute_disturbance_analysis,
-    print_disturbance_analysis,
-    print_stratified_r2
+    print_disturbance_analysis
 )
 
 
@@ -618,13 +617,10 @@ def main():
     # UQ calibration metrics (in log space)
     calibration = compute_calibration_metrics(valid_pred_log, valid_target_log, valid_unc_log)
 
-    # Disturbance analysis (using shared utility, log-space for stratified R²)
+    # Disturbance analysis
     disturbance_analysis = compute_disturbance_analysis(
         gedi_df, test_df, args.pre_years, args.post_years, args.test_year,
-        predictions=pred_final_linear,
-        predictions_log=pred_final,
-        targets_log=target_log,
-        uncertainties_log=unc_final
+        predictions=pred_final_linear
     )
 
     print("\n" + "=" * 80)
@@ -646,10 +642,6 @@ def main():
 
     # Print disturbance analysis using shared utility
     print_disturbance_analysis(disturbance_analysis, indent="  ")
-
-    # Print stratified R² using shared utility
-    if 'stratified_r2' in disturbance_analysis:
-        print_stratified_r2(disturbance_analysis['stratified_r2'], indent="  ")
 
     # Save results
     results = {
@@ -680,8 +672,7 @@ def main():
             'correlation': disturbance_analysis['correlation'],
             'quartile_rmse': disturbance_analysis['quartile_rmse'],
             'summary': disturbance_analysis['summary']
-        },
-        'stratified_r2': disturbance_analysis['stratified_r2']
+        }
     }
 
     with open(output_dir / 'results.json', 'w') as f:

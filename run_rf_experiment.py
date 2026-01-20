@@ -47,8 +47,6 @@ from utils.disturbance import (
     compute_disturbance_analysis,
     print_disturbance_analysis,
     print_stratified_r2,
-    aggregate_stratified_r2,
-    print_aggregated_stratified_r2,
     compute_pooled_stratified_r2
 )
 
@@ -396,13 +394,10 @@ def run_single_seed(
     pre_years = [y for y in args.train_years if y < args.test_year]
     post_years = [y for y in args.train_years if y > args.test_year]
 
-    # Disturbance analysis (log-space for stratified R², consistent with training)
+    # Disturbance analysis
     disturbance_analysis = compute_disturbance_analysis(
         gedi_df, test_df, pre_years, post_years, args.test_year,
-        predictions=pred_linear,
-        predictions_log=pred_log,
-        targets_log=y_test_log.ravel(),
-        uncertainties_log=unc_log
+        predictions=pred_linear
     )
 
     # Save model
@@ -450,8 +445,7 @@ def run_single_seed(
             'correlation': disturbance_analysis['correlation'],
             'quartile_rmse': disturbance_analysis['quartile_rmse'],
             'summary': disturbance_analysis['summary']
-        },
-        'stratified_r2': disturbance_analysis.get('stratified_r2', {})
+        }
     }
 
     with open(seed_output_dir / 'results.json', 'w') as f:
@@ -494,9 +488,6 @@ def aggregate_results(all_results: list) -> dict:
                                for r in successful if r.get('disturbance') and
                                r['disturbance'].get('correlation') and
                                r['disturbance']['correlation'].get('pearson_r') is not None]
-
-    # Use shared utility for stratified R² aggregation
-    stratified_r2_agg = aggregate_stratified_r2(successful)
 
     aggregated = {
         'n_seeds': len(all_results),
@@ -555,8 +546,7 @@ def aggregate_results(all_results: list) -> dict:
                 'mean': float(np.mean(error_disturbance_corr)) if error_disturbance_corr else None,
                 'std': float(np.std(error_disturbance_corr)) if error_disturbance_corr else None,
             }
-        },
-        'stratified_r2': stratified_r2_agg
+        }
     }
 
     return aggregated
@@ -744,28 +734,11 @@ def main():
         print(f"  Coverage 1σ:  {aggregated['calibration']['coverage_1sigma']['mean']:.1f}% (ideal: 68.3%)")
         print(f"  Coverage 2σ:  {aggregated['calibration']['coverage_2sigma']['mean']:.1f}% (ideal: 95.4%)")
 
-    # Print stratified R² (per-seed)
-    if aggregated.get('stratified_r2'):
-        print("\n(Per-seed averaged)")
-        print_aggregated_stratified_r2(aggregated['stratified_r2'])
-
-    # Print pooled stratified R²
+    # Print pooled stratified metrics
     if aggregated.get('pooled_stratified_r2') and not aggregated['pooled_stratified_r2'].get('error'):
         pooled = aggregated['pooled_stratified_r2']
-        thresholds = pooled.get('thresholds', {'stable_max': 0.1, 'disturbed_min': 0.3})
-        stable_max = int(thresholds['stable_max'] * 100)
-        disturbed_min = int(thresholds['disturbed_min'] * 100)
-
-        print(f"\nPooled Stratified R² (all seeds combined, {pooled['total_tiles']} tiles):")
-        for stratum, label in [('stable', f'Stable (<{stable_max}% change)'),
-                               ('moderate', f'Moderate ({stable_max}-{disturbed_min}%)'),
-                               ('disturbed', f'Disturbed (>{disturbed_min}% loss)')]:
-            s = pooled.get(stratum, {})
-            if s.get('r2') is not None:
-                print(f"  {label:24s} R²={s['r2']:.4f}, RMSE={s['rmse']:.2f} Mg/ha "
-                      f"({s['n_shots']} shots, {s['n_tiles']} tiles)")
-            else:
-                print(f"  {label:24s} Not enough data")
+        print(f"\nPooled across {pooled['total_tiles']} tiles, {pooled['total_shots']} shots:")
+        print_stratified_r2(pooled)
 
     print(f"\nResults saved to: {output_dir}")
 
