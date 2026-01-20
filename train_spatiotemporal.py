@@ -19,6 +19,7 @@ import json
 from pathlib import Path
 import pickle
 from time import time
+from typing import Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -30,6 +31,7 @@ from data.gedi import GEDIQuerier
 from data.embeddings import EmbeddingExtractor
 from data.dataset import (
     GEDISpatiotemporalDataset,
+    CrossYearSpatiotemporalDataset,
     collate_neural_process,
     compute_temporal_encoding
 )
@@ -40,6 +42,11 @@ from models.neural_process import (
 )
 from utils.config import save_config, _make_serializable
 from utils.evaluation import evaluate_model
+from utils.disturbance import (
+    compute_disturbance_analysis,
+    print_disturbance_analysis,
+    print_stratified_r2
+)
 
 
 def parse_args():
@@ -48,10 +55,14 @@ def parse_args():
     # Region and temporal arguments
     parser.add_argument('--region_bbox', type=float, nargs=4, required=True,
                         help='Region bounding box: min_lon min_lat max_lon max_lat')
+    parser.add_argument('--fire_shapefile', type=str, default=None,
+                        help='Optional: Path to fire boundary shapefile (.shp) to filter GEDI shots')
     parser.add_argument('--train_years', type=int, nargs='+', required=True,
                         help='Years to use for training (e.g., 2019 2020 2022 2023)')
     parser.add_argument('--test_year', type=int, required=True,
                         help='Year to hold out for testing (e.g., 2021)')
+    parser.add_argument('--test_months', type=int, nargs='+', default=None,
+                        help='Optional: Filter test year to specific months (e.g., 8 9 10 11 12 for Aug-Dec)')
     parser.add_argument('--cache_dir', type=str, default='./cache',
                         help='Directory for caching GEDI query results')
     parser.add_argument('--embeddings_dir', type=str, default='./embeddings',
@@ -73,6 +84,15 @@ def parse_args():
                         help='Architecture mode')
     parser.add_argument('--num_attention_heads', type=int, default=16,
                         help='Number of attention heads')
+    parser.add_argument('--no_temporal_encoding', action='store_true',
+                        help='Disable temporal encoding (spatial-only baseline with 2D coords)')
+    parser.add_argument('--temporal_context', action='store_true',
+                        help='Use train years as context for test prediction (true temporal prediction). '
+                             'Without this flag, test year data is used as context (spatial interpolation).')
+    parser.add_argument('--cross_year_training', action='store_true',
+                        help='Train with cross-year context/target splits. For each tile, randomly '
+                             'holds out one year as target and uses other years as context. '
+                             'This trains the model for the --temporal_context evaluation task.')
 
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=4,
@@ -91,10 +111,12 @@ def parse_args():
                         help='Buffer size in degrees for spatial CV')
     parser.add_argument('--min_shots_per_tile', type=int, default=10,
                         help='Minimum GEDI shots per tile')
-    parser.add_argument('--max_context_shots', type=int, default=1024,
-                        help='Maximum context shots per tile during training (runtime subsampling)')
-    parser.add_argument('--max_target_shots', type=int, default=1024,
-                        help='Maximum target shots per tile during training (runtime subsampling)')
+    parser.add_argument('--max_context_shots', type=int, default=10000,
+                        help='Maximum context shots per tile (subsampled if exceeded for memory)')
+    parser.add_argument('--max_target_shots', type=int, default=5000,
+                        help='Maximum target shots per tile (subsampled if exceeded)')
+    parser.add_argument('--target_chunk_size', type=int, default=2000,
+                        help='Process targets in chunks of this size for memory efficiency')
     parser.add_argument('--early_stopping_patience', type=int, default=25,
                         help='Early stopping patience')
     parser.add_argument('--lr_scheduler_patience', type=int, default=5,
@@ -144,9 +166,50 @@ def set_seed(seed):
         torch.backends.cudnn.benchmark = False
 
 
+def filter_shots_by_shapefile(df: pd.DataFrame, shapefile_path: str) -> pd.DataFrame:
+    """Filter GEDI shots to those inside a shapefile boundary."""
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    # Load shapefile
+    gdf = gpd.read_file(shapefile_path)
+
+    # Ensure CRS is WGS84
+    if gdf.crs is None:
+        gdf = gdf.set_crs('EPSG:4326')
+    elif gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs('EPSG:4326')
+
+    # Create points from GEDI shots
+    points = gpd.GeoSeries(
+        [Point(lon, lat) for lon, lat in zip(df['longitude'], df['latitude'])],
+        crs='EPSG:4326'
+    )
+
+    # Check which points are within the geometry
+    geometry = gdf.union_all() if hasattr(gdf, 'union_all') else gdf.unary_union
+    within_mask = points.within(geometry)
+
+    filtered_df = df[within_mask.values].copy()
+    print(f"Filtered to {len(filtered_df)} shots inside fire perimeter (from {len(df)})")
+
+    return filtered_df
+
+
 def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
-                max_context_shots=1024, max_target_shots=1024):
-    """Train for one epoch with optional runtime subsampling of context/targets."""
+                max_context_shots=20000, max_target_shots=5000, target_chunk_size=2000):
+    """Train for one epoch with chunked target processing to manage memory.
+
+    Args:
+        model: The neural process model
+        dataloader: Training data loader
+        optimizer: Optimizer
+        device: Device to train on
+        kl_weight: Weight for KL divergence term
+        max_context_shots: Maximum context shots (subsampled if exceeded)
+        max_target_shots: Maximum target shots per tile (subsampled if exceeded)
+        target_chunk_size: Process targets in chunks of this size for memory efficiency
+    """
     model.train()
     total_loss = 0
     total_nll = 0
@@ -162,68 +225,224 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
         n_tiles_in_batch = 0
 
         for i in range(len(batch['context_coords'])):
-            context_coords = batch['context_coords'][i].to(device)
-            context_embeddings = batch['context_embeddings'][i].to(device)
-            context_agbd = batch['context_agbd'][i].to(device)
-            target_coords = batch['target_coords'][i].to(device)
-            target_embeddings = batch['target_embeddings'][i].to(device)
-            target_agbd = batch['target_agbd'][i].to(device)
+            # Keep on CPU for now - subsample before moving to GPU
+            context_coords_cpu = batch['context_coords'][i]
+            context_embeddings_cpu = batch['context_embeddings'][i]
+            context_agbd_cpu = batch['context_agbd'][i]
+            target_coords_cpu = batch['target_coords'][i]
+            target_embeddings_cpu = batch['target_embeddings'][i]
+            target_agbd_cpu = batch['target_agbd'][i]
 
-            if len(target_coords) == 0:
+            if len(target_coords_cpu) == 0:
                 continue
 
-            # Runtime subsampling of context if too large (prevents OOM in attention)
-            n_context = len(context_coords)
+            # Subsample context on CPU BEFORE moving to GPU (critical for memory)
+            n_context = len(context_coords_cpu)
             if n_context > max_context_shots:
-                indices = torch.randperm(n_context, device=device)[:max_context_shots]
-                context_coords = context_coords[indices]
-                context_embeddings = context_embeddings[indices]
-                context_agbd = context_agbd[indices]
+                indices = torch.randperm(n_context)[:max_context_shots]
+                context_coords_cpu = context_coords_cpu[indices]
+                context_embeddings_cpu = context_embeddings_cpu[indices]
+                context_agbd_cpu = context_agbd_cpu[indices]
 
-            # Runtime subsampling of targets if too large
-            n_targets = len(target_coords)
+            # Subsample targets on CPU BEFORE moving to GPU
+            n_targets = len(target_coords_cpu)
             if n_targets > max_target_shots:
-                indices = torch.randperm(n_targets, device=device)[:max_target_shots]
-                target_coords = target_coords[indices]
-                target_embeddings = target_embeddings[indices]
-                target_agbd = target_agbd[indices]
+                indices = torch.randperm(n_targets)[:max_target_shots]
+                target_coords_cpu = target_coords_cpu[indices]
+                target_embeddings_cpu = target_embeddings_cpu[indices]
+                target_agbd_cpu = target_agbd_cpu[indices]
+                n_targets = max_target_shots
 
-            pred_mean, pred_log_var, z_mu_context, z_log_sigma_context, z_mu_all, z_log_sigma_all = model(
-                context_coords,
-                context_embeddings,
-                context_agbd,
-                target_coords,
-                target_embeddings,
-                query_agbd=target_agbd,
-                training=True
-            )
+            n_context = len(context_coords_cpu)
 
-            loss, loss_dict = neural_process_loss(
-                pred_mean, pred_log_var, target_agbd,
-                z_mu_context, z_log_sigma_context,
-                z_mu_all, z_log_sigma_all,
-                kl_weight
-            )
+            # Use chunked processing when EITHER context OR targets are large
+            # Large context requires chunked encoding to fit in GPU memory
+            use_chunked = (n_targets > target_chunk_size) or (n_context > target_chunk_size)
 
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"Warning: NaN/Inf loss detected! Skipping batch.")
-                continue
+            if use_chunked:
+                # Chunked processing with gradient accumulation
+                tile_loss_sum = 0.0
+                tile_nll_sum = 0.0
+                tile_kl_sum = 0.0
+                valid_targets = 0
 
-            batch_loss += loss
-            batch_nll += loss_dict['nll']
-            batch_kl += loss_dict['kl']
-            n_tiles_in_batch += 1
+                # For large contexts, encode in chunks then concatenate
+                # This avoids OOM when processing 10k+ context embeddings through CNN
+                context_encoding_chunk_size = target_chunk_size
+                if n_context > context_encoding_chunk_size:
+                    # Encode context in chunks - move each chunk to GPU separately
+                    all_context_emb_features = []
+                    all_context_repr = []
+
+                    for ctx_start in range(0, n_context, context_encoding_chunk_size):
+                        ctx_end = min(ctx_start + context_encoding_chunk_size, n_context)
+
+                        # Move only this chunk to GPU
+                        chunk_coords = context_coords_cpu[ctx_start:ctx_end].to(device)
+                        chunk_embeddings = context_embeddings_cpu[ctx_start:ctx_end].to(device)
+                        chunk_agbd = context_agbd_cpu[ctx_start:ctx_end].to(device)
+
+                        chunk_emb_features, chunk_repr = model.encode_context(
+                            chunk_coords, chunk_embeddings, chunk_agbd
+                        )
+                        all_context_emb_features.append(chunk_emb_features)
+                        all_context_repr.append(chunk_repr)
+
+                        # Free chunk tensors and clear memory
+                        del chunk_coords, chunk_embeddings, chunk_agbd
+                        if 'cuda' in str(device):
+                            torch.cuda.empty_cache()
+
+                    # Concatenate all chunks
+                    context_encoded = (
+                        torch.cat(all_context_emb_features, dim=0),
+                        torch.cat(all_context_repr, dim=0)
+                    )
+                    del all_context_emb_features, all_context_repr
+
+                    # Move context coords/agbd to GPU (needed for forward pass)
+                    context_coords = context_coords_cpu.to(device)
+                    context_agbd = context_agbd_cpu.to(device)
+                else:
+                    # Context fits in memory, move all to GPU and encode at once
+                    context_coords = context_coords_cpu.to(device)
+                    context_embeddings = context_embeddings_cpu.to(device)
+                    context_agbd = context_agbd_cpu.to(device)
+                    context_encoded = model.encode_context(context_coords, context_embeddings, context_agbd)
+
+                    # Free raw embeddings
+                    del context_embeddings
+
+                if 'cuda' in str(device):
+                    torch.cuda.empty_cache()
+
+                # Shuffle targets on CPU for chunking
+                perm = torch.randperm(n_targets)
+                target_coords_cpu = target_coords_cpu[perm]
+                target_embeddings_cpu = target_embeddings_cpu[perm]
+                target_agbd_cpu = target_agbd_cpu[perm]
+
+                n_chunks = (n_targets + target_chunk_size - 1) // target_chunk_size
+                chunk_idx = 0
+
+                for chunk_start in range(0, n_targets, target_chunk_size):
+                    chunk_end = min(chunk_start + target_chunk_size, n_targets)
+                    chunk_size = chunk_end - chunk_start
+                    is_last_chunk = (chunk_idx == n_chunks - 1)
+                    chunk_idx += 1
+
+                    # Move only this chunk to GPU
+                    chunk_target_coords = target_coords_cpu[chunk_start:chunk_end].to(device)
+                    chunk_target_embeddings = target_embeddings_cpu[chunk_start:chunk_end].to(device)
+                    chunk_target_agbd = target_agbd_cpu[chunk_start:chunk_end].to(device)
+
+                    # For non-last chunks, detach context to allow backward without freeing graph
+                    # Last chunk keeps gradients flowing through context encoder
+                    if is_last_chunk:
+                        context_for_chunk = context_encoded
+                    else:
+                        context_for_chunk = (context_encoded[0].detach(), context_encoded[1].detach())
+
+                    # Use pre-encoded context (avoids re-encoding for each chunk)
+                    pred_mean, pred_log_var, z_mu_context, z_log_sigma_context, z_mu_all, z_log_sigma_all = model(
+                        context_coords,
+                        None,  # embeddings not needed - using context_encoded
+                        context_agbd,
+                        chunk_target_coords,
+                        chunk_target_embeddings,
+                        query_agbd=chunk_target_agbd,
+                        training=True,
+                        context_encoded=context_for_chunk
+                    )
+
+                    loss, loss_dict = neural_process_loss(
+                        pred_mean, pred_log_var, chunk_target_agbd,
+                        z_mu_context, z_log_sigma_context,
+                        z_mu_all, z_log_sigma_all,
+                        kl_weight
+                    )
+
+                    if not (torch.isnan(loss) or torch.isinf(loss)):
+                        # Scale loss by chunk weight and accumulate gradients immediately
+                        chunk_weight = chunk_size / n_targets
+                        scaled_loss = loss * chunk_weight / max(n_tiles_in_batch, 1)
+                        scaled_loss.backward()
+
+                        # Track scalar values for logging
+                        tile_loss_sum += loss.item() * chunk_size
+                        tile_nll_sum += loss_dict['nll'] * chunk_size
+                        tile_kl_sum += loss_dict['kl'] * chunk_size
+                        valid_targets += chunk_size
+
+                    # Free memory after each chunk
+                    del pred_mean, pred_log_var, chunk_target_coords, chunk_target_embeddings, chunk_target_agbd
+                    if 'cuda' in str(device):
+                        torch.cuda.empty_cache()
+
+                # Free context encoding after all chunks processed
+                del context_encoded
+                if 'cuda' in str(device):
+                    torch.cuda.empty_cache()
+
+                if valid_targets > 0:
+                    total_loss += tile_loss_sum / valid_targets
+                    total_nll += tile_nll_sum / valid_targets
+                    total_kl += tile_kl_sum / valid_targets
+                    n_tiles += 1
+                    n_tiles_in_batch += 1
+
+            else:
+                # Standard processing for smaller tiles - move all data to GPU
+                context_coords = context_coords_cpu.to(device)
+                context_embeddings = context_embeddings_cpu.to(device)
+                context_agbd = context_agbd_cpu.to(device)
+                target_coords = target_coords_cpu.to(device)
+                target_embeddings = target_embeddings_cpu.to(device)
+                target_agbd = target_agbd_cpu.to(device)
+
+                pred_mean, pred_log_var, z_mu_context, z_log_sigma_context, z_mu_all, z_log_sigma_all = model(
+                    context_coords,
+                    context_embeddings,
+                    context_agbd,
+                    target_coords,
+                    target_embeddings,
+                    query_agbd=target_agbd,
+                    training=True
+                )
+
+                loss, loss_dict = neural_process_loss(
+                    pred_mean, pred_log_var, target_agbd,
+                    z_mu_context, z_log_sigma_context,
+                    z_mu_all, z_log_sigma_all,
+                    kl_weight
+                )
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"Warning: NaN/Inf loss detected! Skipping tile.")
+                    continue
+
+                # For non-chunked tiles, accumulate loss tensor for batch backward
+                batch_loss += loss
+                batch_nll += loss_dict['nll']
+                batch_kl += loss_dict['kl']
+                n_tiles_in_batch += 1
+
+                # Free memory for non-chunked tiles
+                del context_coords, context_embeddings, context_agbd
+                if 'cuda' in str(device):
+                    torch.cuda.empty_cache()
 
         if n_tiles_in_batch > 0:
-            batch_loss = batch_loss / n_tiles_in_batch
-            batch_loss.backward()
+            # For non-chunked tiles, do the backward pass
+            if batch_loss != 0:
+                batch_loss = batch_loss / n_tiles_in_batch
+                batch_loss.backward()
+                total_loss += batch_loss.item()
+                total_nll += batch_nll / n_tiles_in_batch
+                total_kl += batch_kl / n_tiles_in_batch
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-
-            total_loss += batch_loss.item()
-            total_nll += batch_nll / n_tiles_in_batch
-            total_kl += batch_kl / n_tiles_in_batch
-            n_tiles += n_tiles_in_batch
 
         # Clear cache after each batch to reduce memory fragmentation
         if 'cuda' in str(device):
@@ -236,95 +455,127 @@ def train_epoch(model, dataloader, optimizer, device, kl_weight=1.0,
     }
 
 
-def compute_disturbance_analysis(
-    gedi_df: pd.DataFrame,
+def predict_on_test_df(
+    model: torch.nn.Module,
     test_df: pd.DataFrame,
-    train_years: list,
-    test_year: int
-) -> dict:
+    context_df: pd.DataFrame,
+    global_bounds: tuple,
+    temporal_bounds: tuple,
+    device: str,
+    max_context_shots: int = 1024,
+    include_temporal: bool = True
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Compute per-tile disturbance metrics.
+    Generate predictions on test_df while preserving shot order.
 
-    Disturbance intensity = (expected - observed) / expected
-    where expected = (pre_mean + post_mean) / 2, or just pre_mean if no post.
+    Uses tile-based context selection (same tile from context_df).
+    Returns predictions and uncertainties aligned with test_df index.
 
-    For spatiotemporal, we infer pre/post from train_years relative to test_year.
+    Args:
+        include_temporal: If True, use 5D coords (lon, lat, sin_doy, cos_doy, norm_time).
+                         If False, use 2D coords (lon, lat) for spatial-only baseline.
     """
-    from scipy import stats
+    model.eval()
 
-    # Infer pre and post years from train_years
-    pre_years = [y for y in train_years if y < test_year]
-    post_years = [y for y in train_years if y > test_year]
+    from utils.normalization import normalize_agbd
 
-    # Get test tiles
+    # Group test points by tile
     test_tiles = test_df['tile_id'].unique()
 
-    # Compute per-tile statistics
-    tile_stats = []
-    for tile_id in test_tiles:
-        # Pre-event mean for this tile
-        pre_data = gedi_df[(gedi_df['tile_id'] == tile_id) &
-                           (gedi_df['year'].isin(pre_years))]
-        pre_mean = pre_data['agbd'].mean() if len(pre_data) > 0 else np.nan
+    all_predictions = []
+    all_uncertainties = []
+    all_indices = []
 
-        # Post-event mean for this tile
-        post_data = gedi_df[(gedi_df['tile_id'] == tile_id) &
-                            (gedi_df['year'].isin(post_years))]
-        post_mean = post_data['agbd'].mean() if len(post_data) > 0 else np.nan
+    with torch.no_grad():
+        for tile_id in tqdm(test_tiles, desc='Predicting by tile'):
+            # Get test points for this tile
+            tile_test = test_df[test_df['tile_id'] == tile_id]
+            tile_indices = tile_test.index.tolist()
 
-        # Test year mean for this tile
-        test_tile_df = test_df[test_df['tile_id'] == tile_id]
-        test_mean = test_tile_df['agbd'].mean()
-        n_test_shots = len(test_tile_df)
+            # Get context points for this tile
+            tile_context = context_df[context_df['tile_id'] == tile_id]
 
-        # Expected value (linear interpolation assumption)
-        if not np.isnan(pre_mean) and not np.isnan(post_mean):
-            expected = (pre_mean + post_mean) / 2
-        elif not np.isnan(pre_mean):
-            expected = pre_mean
-        elif not np.isnan(post_mean):
-            expected = post_mean
-        else:
-            expected = np.nan
+            if len(tile_context) == 0:
+                # No context for this tile, use NaN predictions
+                all_predictions.extend([np.nan] * len(tile_test))
+                all_uncertainties.extend([np.nan] * len(tile_test))
+                all_indices.extend(tile_indices)
+                continue
 
-        if not np.isnan(expected) and expected > 0:
-            disturbance = (expected - test_mean) / expected
-            change_from_pre = (pre_mean - test_mean) / pre_mean if not np.isnan(pre_mean) and pre_mean > 0 else np.nan
-        else:
-            disturbance = np.nan
-            change_from_pre = np.nan
+            # Subsample context BEFORE np.stack to avoid memory issues with large tiles
+            if len(tile_context) > max_context_shots:
+                tile_context = tile_context.sample(n=max_context_shots)
 
-        tile_stats.append({
-            'tile_id': tile_id,
-            'pre_mean': pre_mean,
-            'post_mean': post_mean,
-            'test_mean': test_mean,
-            'expected': expected,
-            'disturbance': disturbance,
-            'change_from_pre': change_from_pre,
-            'n_test_shots': n_test_shots,
-            'n_pre_shots': len(pre_data),
-            'n_post_shots': len(post_data)
-        })
+            # Now extract features from subsampled data
+            ctx_coords = tile_context[['longitude', 'latitude']].values
+            ctx_embeddings = np.stack(tile_context['embedding_patch'].values)
+            ctx_agbd = tile_context['agbd'].values[:, None]
+            ctx_time = pd.to_datetime(tile_context['time'])
 
-    tile_df = pd.DataFrame(tile_stats)
+            # Normalize spatial coords
+            lon_min, lat_min, lon_max, lat_max = global_bounds
+            ctx_coords_norm = np.zeros_like(ctx_coords)
+            ctx_coords_norm[:, 0] = (ctx_coords[:, 0] - lon_min) / (lon_max - lon_min + 1e-8)
+            ctx_coords_norm[:, 1] = (ctx_coords[:, 1] - lat_min) / (lat_max - lat_min + 1e-8)
 
-    # Summary statistics
-    valid_mask = ~tile_df['disturbance'].isna()
+            # Build coordinate vector: spatial only or spatiotemporal
+            if include_temporal:
+                ctx_temporal = compute_temporal_encoding(ctx_time, temporal_bounds)
+                ctx_final_coords = np.concatenate([ctx_coords_norm, ctx_temporal], axis=1)
+            else:
+                ctx_final_coords = ctx_coords_norm
 
-    return {
-        'per_tile': tile_df.to_dict('records'),
-        'pre_years': pre_years,
-        'post_years': post_years,
-        'summary': {
-            'mean_disturbance': float(tile_df['disturbance'].mean()) if valid_mask.any() else None,
-            'std_disturbance': float(tile_df['disturbance'].std()) if valid_mask.any() else None,
-            'n_tiles_with_loss': int((tile_df['disturbance'] > 0).sum()),
-            'n_tiles_with_gain': int((tile_df['disturbance'] < 0).sum()),
-            'pct_tiles_major_loss': float((tile_df['disturbance'] > 0.3).mean() * 100) if valid_mask.any() else None,
-            'mean_change_from_pre': float(tile_df['change_from_pre'].mean()) if valid_mask.any() else None
-        }
-    }
+            ctx_agbd_norm = normalize_agbd(ctx_agbd)
+
+            # Prepare targets
+            tgt_coords = tile_test[['longitude', 'latitude']].values
+            tgt_embeddings = np.stack(tile_test['embedding_patch'].values)
+            tgt_time = pd.to_datetime(tile_test['time'])
+
+            tgt_coords_norm = np.zeros_like(tgt_coords)
+            tgt_coords_norm[:, 0] = (tgt_coords[:, 0] - lon_min) / (lon_max - lon_min + 1e-8)
+            tgt_coords_norm[:, 1] = (tgt_coords[:, 1] - lat_min) / (lat_max - lat_min + 1e-8)
+
+            # Build target coordinate vector
+            if include_temporal:
+                tgt_temporal = compute_temporal_encoding(tgt_time, temporal_bounds)
+                tgt_final_coords = np.concatenate([tgt_coords_norm, tgt_temporal], axis=1)
+            else:
+                tgt_final_coords = tgt_coords_norm
+
+            # To tensors
+            ctx_coords_t = torch.from_numpy(ctx_final_coords).float().to(device)
+            ctx_embeddings_t = torch.from_numpy(ctx_embeddings).float().to(device)
+            ctx_agbd_t = torch.from_numpy(ctx_agbd_norm).float().to(device)
+            tgt_coords_t = torch.from_numpy(tgt_final_coords).float().to(device)
+            tgt_embeddings_t = torch.from_numpy(tgt_embeddings).float().to(device)
+
+            # Predict
+            pred_mean, pred_std = model.predict(
+                ctx_coords_t, ctx_embeddings_t, ctx_agbd_t,
+                tgt_coords_t, tgt_embeddings_t
+            )
+
+            all_predictions.extend(pred_mean.cpu().numpy().flatten().tolist())
+            all_uncertainties.extend(pred_std.cpu().numpy().flatten().tolist())
+            all_indices.extend(tile_indices)
+
+            # Clear GPU cache
+            if 'cuda' in str(device):
+                torch.cuda.empty_cache()
+
+    # Reorder to match original test_df order
+    result_df = pd.DataFrame({
+        'idx': all_indices,
+        'pred': all_predictions,
+        'unc': all_uncertainties
+    }).set_index('idx')
+
+    # Align with test_df index
+    predictions = result_df.loc[test_df.index, 'pred'].values
+    uncertainties = result_df.loc[test_df.index, 'unc'].values
+
+    return predictions, uncertainties
 
 
 def validate(model, dataloader, device, kl_weight=1.0, agbd_scale=200.0, log_transform_agbd=True,
@@ -383,6 +634,14 @@ def main():
     )
     print(f"Retrieved {len(gedi_df)} GEDI shots across {gedi_df['tile_id'].nunique()} tiles")
 
+    # Apply fire shapefile filter if specified
+    if args.fire_shapefile:
+        print(f"\nApplying fire perimeter filter from: {args.fire_shapefile}")
+        gedi_df = filter_shots_by_shapefile(gedi_df, args.fire_shapefile)
+        if len(gedi_df) == 0:
+            print("No GEDI shots inside fire perimeter. Exiting.")
+            return
+
     # Add year column
     gedi_df['year'] = pd.to_datetime(gedi_df['time']).dt.year
     print(f"Shots per year: {dict(gedi_df['year'].value_counts().sort_index())}")
@@ -432,6 +691,14 @@ def main():
         random_state=args.seed
     )
     train_df, val_df, test_df = splitter.split()
+
+    # Filter test data to specific months if specified
+    if args.test_months:
+        test_df['month'] = pd.to_datetime(test_df['time']).dt.month
+        original_count = len(test_df)
+        test_df = test_df[test_df['month'].isin(args.test_months)].copy()
+        test_df = test_df.drop(columns=['month'])
+        print(f"Filtered test data to months {args.test_months}: {len(test_df)} shots (from {original_count})")
     print()
 
     # Compute global bounds from training data
@@ -459,7 +726,24 @@ def main():
     # Step 4: Create datasets (no max_shots_per_tile - using runtime subsampling instead)
     print("\nStep 4: Creating datasets...")
     print(f"  Runtime subsampling: max_context={args.max_context_shots}, max_target={args.max_target_shots}")
-    train_dataset = GEDISpatiotemporalDataset(
+    include_temporal = not args.no_temporal_encoding
+
+    # Choose dataset class based on training mode
+    if args.cross_year_training:
+        print(f"  Training mode: CROSS-YEAR (context from other years, target from held-out year)")
+        DatasetClass = CrossYearSpatiotemporalDataset
+        # Pass max_context/target_shots to subsample BEFORE np.stack (avoids OOM on large tiles)
+        extra_args = {
+            'min_years_per_tile': 2,
+            'max_context_shots': args.max_context_shots,
+            'max_target_shots': args.max_target_shots
+        }
+    else:
+        print(f"  Training mode: STANDARD (random context/target split within mixed years)")
+        DatasetClass = GEDISpatiotemporalDataset
+        extra_args = {}
+
+    train_dataset = DatasetClass(
         train_df,
         min_shots_per_tile=args.min_shots_per_tile,
         agbd_scale=args.agbd_scale,
@@ -467,8 +751,12 @@ def main():
         augment_coords=args.augment_coords,
         coord_noise_std=args.coord_noise_std,
         global_bounds=global_bounds,
-        temporal_bounds=temporal_bounds
+        temporal_bounds=temporal_bounds,
+        include_temporal=include_temporal,
+        **extra_args
     )
+
+    # Validation and test always use standard dataset (we evaluate on specific years)
     val_dataset = GEDISpatiotemporalDataset(
         val_df,
         min_shots_per_tile=args.min_shots_per_tile,
@@ -476,7 +764,8 @@ def main():
         log_transform_agbd=args.log_transform_agbd,
         augment_coords=False,
         global_bounds=global_bounds,
-        temporal_bounds=temporal_bounds
+        temporal_bounds=temporal_bounds,
+        include_temporal=include_temporal
     )
     test_dataset = GEDISpatiotemporalDataset(
         test_df,
@@ -485,7 +774,8 @@ def main():
         log_transform_agbd=args.log_transform_agbd,
         augment_coords=False,
         global_bounds=global_bounds,
-        temporal_bounds=temporal_bounds
+        temporal_bounds=temporal_bounds,
+        include_temporal=include_temporal
     )
 
     train_loader = DataLoader(
@@ -502,10 +792,14 @@ def main():
     )
     print()
 
-    # Step 5: Initialize model with coord_dim=5 for spatiotemporal
+    # Step 5: Initialize model with appropriate coord_dim
     print("Step 5: Initializing model...")
     print(f"Architecture mode: {args.architecture_mode}")
-    print(f"Coordinate dimension: 5 (lon, lat, sin_doy, cos_doy, norm_time)")
+    coord_dim = 2 if args.no_temporal_encoding else 5
+    if args.no_temporal_encoding:
+        print(f"Coordinate dimension: 2 (lon, lat) - spatial-only baseline")
+    else:
+        print(f"Coordinate dimension: 5 (lon, lat, sin_doy, cos_doy, norm_time)")
 
     model = GEDINeuralProcess(
         patch_size=args.patch_size,
@@ -517,7 +811,7 @@ def main():
         output_uncertainty=True,
         architecture_mode=args.architecture_mode,
         num_attention_heads=args.num_attention_heads,
-        coord_dim=5  # Spatiotemporal: lon, lat, sin_doy, cos_doy, norm_time
+        coord_dim=coord_dim
     ).to(args.device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -567,7 +861,8 @@ def main():
         train_metrics = train_epoch(
             model, train_loader, optimizer, args.device, kl_weight,
             max_context_shots=args.max_context_shots,
-            max_target_shots=args.max_target_shots
+            max_target_shots=args.max_target_shots,
+            target_chunk_size=args.target_chunk_size
         )
         train_losses.append(train_metrics['loss'])
 
@@ -674,6 +969,7 @@ def main():
     if test_metrics:
         print(f"  Log R²: {test_metrics.get('log_r2', 0):.4f}")
         print(f"  Log RMSE: {test_metrics.get('log_rmse', 0):.4f}")
+        print(f"  Linear R²: {test_metrics.get('linear_r2', 0):.4f}")
         print(f"  Linear RMSE: {test_metrics.get('linear_rmse', 0):.2f} Mg/ha")
         print(f"  Linear MAE: {test_metrics.get('linear_mae', 0):.2f} Mg/ha")
         # UQ calibration metrics
@@ -685,22 +981,65 @@ def main():
             print(f"    Coverage 2σ:  {test_metrics.get('coverage_2sigma', 0):.1f}% (ideal: 95.4%)")
             print(f"    Coverage 3σ:  {test_metrics.get('coverage_3sigma', 0):.1f}% (ideal: 99.7%)")
 
-    # Compute disturbance analysis
+    # Generate predictions with shot-level mapping for stratified analysis
+    from utils.normalization import denormalize_agbd
+
+    if args.temporal_context:
+        # Use train years as context for true temporal prediction
+        # This tests the model's ability to predict held-out year from surrounding years
+        context_df = gedi_df[gedi_df['year'].isin(args.train_years)].copy()
+        print(f"\n  Generating predictions with TEMPORAL context (train years: {args.train_years})...")
+        print(f"    Context pool: {len(context_df)} shots from {args.train_years}")
+        print(f"    Targets: {len(test_df)} shots from {args.test_year}")
+
+        # Debug: Check overlap between test tiles and context tiles
+        test_tiles = set(test_df['tile_id'].unique())
+        context_tiles = set(context_df['tile_id'].unique())
+        overlap_tiles = test_tiles & context_tiles
+        print(f"    Test tiles: {len(test_tiles)}, Context tiles with train data: {len(overlap_tiles)}")
+        if len(overlap_tiles) == 0:
+            print("    WARNING: No test tiles have train year observations! Predictions will be NaN.")
+    else:
+        # Use test_df itself as context (same tile, same year - spatial interpolation)
+        context_df = test_df
+        print("\n  Generating predictions with SAME-YEAR context (spatial interpolation)...")
+
+    test_preds_log, test_unc_log = predict_on_test_df(
+        model, test_df, context_df,
+        global_bounds, temporal_bounds, args.device,
+        max_context_shots=args.max_context_shots,
+        include_temporal=include_temporal
+    )
+    # Denormalize predictions to linear scale for disturbance analysis
+    test_preds_linear = denormalize_agbd(test_preds_log)
+
+    # Split train years into pre/post relative to test year
+    pre_years = [y for y in args.train_years if y < args.test_year]
+    post_years = [y for y in args.train_years if y > args.test_year]
+
+    # Compute disturbance analysis with predictions for stratified R²
     disturbance_analysis = compute_disturbance_analysis(
-        gedi_df, test_df, args.train_years, args.test_year
+        gedi_df, test_df, pre_years, post_years, args.test_year,
+        predictions=test_preds_linear
     )
 
-    print(f"\n  Disturbance Analysis:")
-    if disturbance_analysis['summary']['mean_disturbance'] is not None:
-        print(f"    Mean disturbance: {disturbance_analysis['summary']['mean_disturbance']:.1%}")
-        print(f"    Tiles with biomass loss: {disturbance_analysis['summary']['n_tiles_with_loss']}")
-        print(f"    Tiles with major loss (>30%): {disturbance_analysis['summary']['pct_tiles_major_loss']:.1f}%")
-    else:
-        print(f"    No valid disturbance data")
+    # Print disturbance analysis using shared utility
+    print_disturbance_analysis(disturbance_analysis, indent="    ")
+
+    # Print stratified R² using shared utility
+    if 'stratified_r2' in disturbance_analysis:
+        print_stratified_r2(disturbance_analysis['stratified_r2'], indent="    ")
 
     # Save per-tile disturbance analysis
     tile_disturbance_df = pd.DataFrame(disturbance_analysis['per_tile'])
     tile_disturbance_df.to_parquet(output_dir / 'tile_disturbance.parquet')
+
+    # Save predictions for analysis
+    test_df_out = test_df[['latitude', 'longitude', 'agbd', 'time', 'tile_id']].copy()
+    test_df_out['pred'] = test_preds_linear
+    test_df_out['unc'] = denormalize_agbd(test_unc_log) if test_unc_log is not None else np.nan
+    test_df_out['residual'] = test_df['agbd'].values - test_preds_linear
+    test_df_out.to_parquet(output_dir / 'test_predictions.parquet')
 
     # Save final results
     checkpoint['test_metrics'] = test_metrics
@@ -718,9 +1057,14 @@ def main():
         'disturbance': {
             'pre_years': disturbance_analysis['pre_years'],
             'post_years': disturbance_analysis['post_years'],
+            'correlation': disturbance_analysis['correlation'],
+            'quartile_rmse': disturbance_analysis['quartile_rmse'],
             'summary': disturbance_analysis['summary']
         }
     }
+    if 'stratified_r2' in disturbance_analysis:
+        results['stratified_r2'] = disturbance_analysis['stratified_r2']
+
     with open(output_dir / 'results.json', 'w') as f:
         json.dump(_make_serializable(results), f, indent=2)
 

@@ -24,6 +24,12 @@ from pathlib import Path
 from datetime import datetime
 import numpy as np
 
+from utils.disturbance import (
+    aggregate_stratified_r2,
+    print_aggregated_stratified_r2,
+    compute_pooled_stratified_r2
+)
+
 # Get project root directory for PYTHONPATH
 PROJECT_ROOT = Path(__file__).parent.resolve()
 
@@ -34,10 +40,14 @@ def parse_args():
     # Region and temporal arguments
     parser.add_argument('--region_bbox', type=float, nargs=4, required=True,
                         help='Region bounding box: min_lon min_lat max_lon max_lat')
+    parser.add_argument('--fire_shapefile', type=str, default=None,
+                        help='Optional: Path to fire boundary shapefile (.shp) to filter GEDI shots')
     parser.add_argument('--train_years', type=int, nargs='+', required=True,
                         help='Years to use for training')
     parser.add_argument('--test_year', type=int, required=True,
                         help='Year to hold out for testing')
+    parser.add_argument('--test_months', type=int, nargs='+', default=None,
+                        help='Optional: Filter test year to specific months (e.g., 8 9 10 11 12 for Aug-Dec)')
 
     # Experiment arguments
     parser.add_argument('--n_seeds', type=int, default=10,
@@ -61,6 +71,12 @@ def parse_args():
                         help='Maximum context shots per tile (runtime subsampling)')
     parser.add_argument('--max_target_shots', type=int, default=1024,
                         help='Maximum target shots per tile (runtime subsampling)')
+    parser.add_argument('--no_temporal_encoding', action='store_true',
+                        help='Disable temporal encoding (spatial-only baseline)')
+    parser.add_argument('--temporal_context', action='store_true',
+                        help='Use train years as context for test prediction (true temporal prediction)')
+    parser.add_argument('--cross_year_training', action='store_true',
+                        help='Train with cross-year context/target splits (pairs with --temporal_context)')
 
     # Infrastructure
     parser.add_argument('--cache_dir', type=str, default='./cache',
@@ -92,6 +108,26 @@ def run_single_seed(seed: int, args, seed_output_dir: Path) -> dict:
         '--embeddings_dir', args.embeddings_dir,
         '--device', args.device,
     ]
+
+    # Add optional fire shapefile filter
+    if args.fire_shapefile:
+        cmd.extend(['--fire_shapefile', args.fire_shapefile])
+
+    # Add optional test months filter
+    if args.test_months:
+        cmd.extend(['--test_months', *[str(m) for m in args.test_months]])
+
+    # Add spatial-only baseline flag
+    if args.no_temporal_encoding:
+        cmd.append('--no_temporal_encoding')
+
+    # Add temporal context flag (use train years as context for prediction)
+    if args.temporal_context:
+        cmd.append('--temporal_context')
+
+    # Add cross-year training flag (train with year-based context/target splits)
+    if args.cross_year_training:
+        cmd.append('--cross_year_training')
 
     print(f"\n{'='*80}")
     print(f"Running seed {seed}")
@@ -131,9 +167,12 @@ def aggregate_results(all_results: list) -> dict:
             'n_successful': 0
         }
 
-    # Extract metrics
-    test_r2 = [r['test_metrics'].get('log_r2', 0) for r in successful if r.get('test_metrics')]
-    test_rmse = [r['test_metrics'].get('linear_rmse', 0) for r in successful if r.get('test_metrics')]
+    # Extract metrics (matching baseline format)
+    log_r2 = [r['test_metrics'].get('log_r2', 0) for r in successful if r.get('test_metrics')]
+    log_rmse = [r['test_metrics'].get('log_rmse', 0) for r in successful if r.get('test_metrics')]
+    linear_r2 = [r['test_metrics'].get('linear_r2', 0) for r in successful if r.get('test_metrics')]
+    linear_rmse = [r['test_metrics'].get('linear_rmse', 0) for r in successful if r.get('test_metrics')]
+    linear_mae = [r['test_metrics'].get('linear_mae', 0) for r in successful if r.get('test_metrics')]
     train_times = [r.get('train_time', 0) for r in successful]
 
     # Extract calibration metrics
@@ -147,21 +186,41 @@ def aggregate_results(all_results: list) -> dict:
                         for r in successful if r.get('disturbance') and r['disturbance']['summary'].get('mean_disturbance') is not None]
     pct_major_loss = [r['disturbance']['summary']['pct_tiles_major_loss']
                       for r in successful if r.get('disturbance') and r['disturbance']['summary'].get('pct_tiles_major_loss') is not None]
+    error_disturbance_corr = [r['disturbance']['correlation']['pearson_r']
+                               for r in successful if r.get('disturbance') and r['disturbance'].get('correlation') and r['disturbance']['correlation'].get('pearson_r') is not None]
+
+    # Use shared utility for stratified R² aggregation
+    stratified_r2_agg = aggregate_stratified_r2(successful)
 
     aggregated = {
         'n_seeds': len(all_results),
         'n_successful': len(successful),
-        'test_r2': {
-            'mean': float(np.mean(test_r2)) if test_r2 else None,
-            'std': float(np.std(test_r2)) if test_r2 else None,
-            'min': float(np.min(test_r2)) if test_r2 else None,
-            'max': float(np.max(test_r2)) if test_r2 else None,
-            'values': test_r2
+        'log_r2': {
+            'mean': float(np.mean(log_r2)) if log_r2 else None,
+            'std': float(np.std(log_r2)) if log_r2 else None,
+            'min': float(np.min(log_r2)) if log_r2 else None,
+            'max': float(np.max(log_r2)) if log_r2 else None,
+            'values': log_r2
         },
-        'test_rmse': {
-            'mean': float(np.mean(test_rmse)) if test_rmse else None,
-            'std': float(np.std(test_rmse)) if test_rmse else None,
-            'values': test_rmse
+        'log_rmse': {
+            'mean': float(np.mean(log_rmse)) if log_rmse else None,
+            'std': float(np.std(log_rmse)) if log_rmse else None,
+            'values': log_rmse
+        },
+        'linear_r2': {
+            'mean': float(np.mean(linear_r2)) if linear_r2 else None,
+            'std': float(np.std(linear_r2)) if linear_r2 else None,
+            'values': linear_r2
+        },
+        'linear_rmse': {
+            'mean': float(np.mean(linear_rmse)) if linear_rmse else None,
+            'std': float(np.std(linear_rmse)) if linear_rmse else None,
+            'values': linear_rmse
+        },
+        'linear_mae': {
+            'mean': float(np.mean(linear_mae)) if linear_mae else None,
+            'std': float(np.std(linear_mae)) if linear_mae else None,
+            'values': linear_mae
         },
         'train_time': {
             'mean': float(np.mean(train_times)) if train_times else None,
@@ -199,8 +258,14 @@ def aggregate_results(all_results: list) -> dict:
                 'mean': float(np.mean(pct_major_loss)) if pct_major_loss else None,
                 'std': float(np.std(pct_major_loss)) if pct_major_loss else None,
                 'values': pct_major_loss
+            },
+            'error_disturbance_correlation': {
+                'mean': float(np.mean(error_disturbance_corr)) if error_disturbance_corr else None,
+                'std': float(np.std(error_disturbance_corr)) if error_disturbance_corr else None,
+                'values': error_disturbance_corr
             }
-        }
+        },
+        'stratified_r2': stratified_r2_agg
     }
 
     return aggregated
@@ -215,8 +280,10 @@ def main():
     # Save experiment config
     experiment_config = {
         'region_bbox': args.region_bbox,
+        'fire_shapefile': args.fire_shapefile,
         'train_years': args.train_years,
         'test_year': args.test_year,
+        'test_months': args.test_months,
         'n_seeds': args.n_seeds,
         'start_seed': args.start_seed,
         'architecture_mode': args.architecture_mode,
@@ -225,6 +292,9 @@ def main():
         'batch_size': args.batch_size,
         'max_context_shots': args.max_context_shots,
         'max_target_shots': args.max_target_shots,
+        'no_temporal_encoding': args.no_temporal_encoding,
+        'temporal_context': args.temporal_context,
+        'cross_year_training': args.cross_year_training,
         'started_at': datetime.now().isoformat()
     }
 
@@ -259,6 +329,35 @@ def main():
     aggregated['experiment_config'] = experiment_config
     aggregated['completed_at'] = datetime.now().isoformat()
 
+    # Compute pooled stratified R² (more robust than averaging across seeds)
+    try:
+        import pickle
+        import pandas as pd
+        # Load GEDI data from first successful seed
+        gedi_df = None
+        for seed_dir in sorted(output_dir.glob('seed_*')):
+            pkl_file = seed_dir / 'processed_data.pkl'
+            if pkl_file.exists():
+                with open(pkl_file, 'rb') as f:
+                    gedi_df = pickle.load(f)
+                # Ensure year column exists
+                if 'year' not in gedi_df.columns:
+                    gedi_df['year'] = pd.to_datetime(gedi_df['time']).dt.year
+                break
+
+        if gedi_df is not None:
+            # Determine pre/post years from train_years relative to test_year
+            pre_years = [y for y in args.train_years if y < args.test_year]
+            post_years = [y for y in args.train_years if y > args.test_year]
+
+            pooled_stratified = compute_pooled_stratified_r2(
+                output_dir, gedi_df, pre_years, post_years
+            )
+            aggregated['pooled_stratified_r2'] = pooled_stratified
+            print("\nComputed pooled stratified R² across all seeds")
+    except Exception as e:
+        print(f"\nWarning: Could not compute pooled stratified R²: {e}")
+
     with open(output_dir / 'aggregated_results.json', 'w') as f:
         json.dump(aggregated, f, indent=2)
 
@@ -268,14 +367,16 @@ def main():
     print("=" * 80)
     print(f"Successful runs: {aggregated['n_successful']}/{aggregated['n_seeds']}")
 
-    if aggregated.get('test_r2', {}).get('mean') is not None:
-        print(f"\nTest R² (log-space):")
-        print(f"  Mean: {aggregated['test_r2']['mean']:.4f} ± {aggregated['test_r2']['std']:.4f}")
-        print(f"  Range: [{aggregated['test_r2']['min']:.4f}, {aggregated['test_r2']['max']:.4f}]")
+    if aggregated.get('log_r2', {}).get('mean') is not None:
+        print(f"\nLog-space metrics:")
+        print(f"  R²:   {aggregated['log_r2']['mean']:.4f} ± {aggregated['log_r2']['std']:.4f}  (range: [{aggregated['log_r2']['min']:.4f}, {aggregated['log_r2']['max']:.4f}])")
+        print(f"  RMSE: {aggregated['log_rmse']['mean']:.4f} ± {aggregated['log_rmse']['std']:.4f}")
 
-    if aggregated.get('test_rmse', {}).get('mean') is not None:
-        print(f"\nTest RMSE (Mg/ha):")
-        print(f"  Mean: {aggregated['test_rmse']['mean']:.2f} ± {aggregated['test_rmse']['std']:.2f}")
+    if aggregated.get('linear_r2', {}).get('mean') is not None:
+        print(f"\nLinear-space metrics:")
+        print(f"  R²:   {aggregated['linear_r2']['mean']:.4f} ± {aggregated['linear_r2']['std']:.4f}")
+        print(f"  RMSE: {aggregated['linear_rmse']['mean']:.2f} ± {aggregated['linear_rmse']['std']:.2f} Mg/ha")
+        print(f"  MAE:  {aggregated['linear_mae']['mean']:.2f} ± {aggregated['linear_mae']['std']:.2f} Mg/ha")
 
     if aggregated.get('train_time', {}).get('total') is not None:
         print(f"\nTotal training time: {aggregated['train_time']['total']/3600:.2f} hours")
@@ -291,6 +392,30 @@ def main():
         print(f"\nDisturbance Analysis:")
         print(f"  Mean disturbance: {aggregated['disturbance']['mean_disturbance']['mean']:.1%} ± {aggregated['disturbance']['mean_disturbance']['std']:.1%}")
         print(f"  Tiles with major loss (>30%): {aggregated['disturbance']['pct_tiles_major_loss']['mean']:.1f}% ± {aggregated['disturbance']['pct_tiles_major_loss']['std']:.1f}%")
+        if aggregated['disturbance'].get('error_disturbance_correlation', {}).get('mean') is not None:
+            print(f"  Error-disturbance correlation: r={aggregated['disturbance']['error_disturbance_correlation']['mean']:.3f} ± {aggregated['disturbance']['error_disturbance_correlation']['std']:.3f}")
+
+    # Print stratified R² using shared utility (per-seed averaging)
+    if aggregated.get('stratified_r2'):
+        print("\n(Per-seed averaged - see pooled_stratified_r2 for more robust analysis)")
+        print_aggregated_stratified_r2(aggregated['stratified_r2'])
+
+    # Print pooled stratified R² (more robust)
+    if aggregated.get('pooled_stratified_r2') and not aggregated['pooled_stratified_r2'].get('error'):
+        pooled = aggregated['pooled_stratified_r2']
+        thresholds = pooled.get('thresholds', {'stable_max': 0.1, 'disturbed_min': 0.3})
+        stable_max = int(thresholds['stable_max'] * 100)
+        disturbed_min = int(thresholds['disturbed_min'] * 100)
+
+        print(f"\nPooled Stratified R² (all seeds combined, {pooled['total_tiles']} tiles, {pooled['total_shots']} shots):")
+        for stratum, label in [('stable', f'Stable (<{stable_max}% change)'),
+                               ('moderate', f'Moderate ({stable_max}-{disturbed_min}%)'),
+                               ('disturbed', f'Disturbed (>{disturbed_min}% loss)')]:
+            s = pooled.get(stratum, {})
+            if s.get('r2') is not None:
+                print(f"  {label:24s} R²={s['r2']:.4f}, RMSE={s['rmse']:.2f} Mg/ha ({s['n_shots']} shots, {s['n_tiles']} tiles)")
+            else:
+                print(f"  {label:24s} Not enough data")
 
     print(f"\nResults saved to: {output_dir}")
 

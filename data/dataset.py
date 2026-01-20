@@ -330,7 +330,8 @@ class GEDISpatiotemporalDataset(Dataset):
         coord_noise_std: float = 0.01,
         global_bounds: Optional[Tuple[float, float, float, float]] = None,
         temporal_bounds: Optional[Tuple[float, float]] = None,
-        time_column: str = 'time'
+        time_column: str = 'time',
+        include_temporal: bool = True
     ):
         """
         Initialize spatiotemporal dataset.
@@ -350,15 +351,18 @@ class GEDISpatiotemporalDataset(Dataset):
             global_bounds: (lon_min, lat_min, lon_max, lat_max) for normalization
             temporal_bounds: (t_min, t_max) as unix timestamps for temporal normalization
             time_column: Name of the timestamp column in data_df
+            include_temporal: If True, include temporal encoding (5D coords).
+                            If False, use spatial coords only (2D coords).
         """
         self.data_df = data_df[data_df['embedding_patch'].notna()].copy()
         self.time_column = time_column
+        self.include_temporal = include_temporal
 
         # Ensure timestamp column exists
         if time_column not in self.data_df.columns:
             raise ValueError(f"Time column '{time_column}' not found in dataframe")
 
-        # Compute temporal encoding for all data
+        # Compute temporal encoding for all data (even if not used, for consistency)
         if temporal_bounds is None:
             timestamps = pd.to_datetime(self.data_df[time_column])
             unix_time = timestamps.astype(np.int64) / 1e9
@@ -397,7 +401,8 @@ class GEDISpatiotemporalDataset(Dataset):
         else:
             self.lon_min, self.lat_min, self.lon_max, self.lat_max = global_bounds
 
-        print(f"Spatiotemporal dataset initialized with {len(self.tiles)} tiles")
+        mode = "spatiotemporal (5D)" if include_temporal else "spatial-only (2D)"
+        print(f"Dataset initialized with {len(self.tiles)} tiles, coords: {mode}")
         if len(self.tiles) > 0:
             shots_per_tile = [len(t) for t in self.tiles]
             print(f"Shots per tile: min={min(shots_per_tile)}, "
@@ -416,10 +421,10 @@ class GEDISpatiotemporalDataset(Dataset):
         Get a training sample with spatiotemporal features.
 
         Returns a dict with:
-            - context_coords: (n_context, 5) [lon, lat, sin_doy, cos_doy, norm_time]
+            - context_coords: (n_context, D) where D=5 if include_temporal else D=2
             - context_embeddings: (n_context, patch_size, patch_size, 128)
             - context_agbd: (n_context, 1)
-            - target_coords: (n_target, 5)
+            - target_coords: (n_target, D)
             - target_embeddings: (n_target, patch_size, patch_size, 128)
             - target_agbd: (n_target, 1)
         """
@@ -434,7 +439,6 @@ class GEDISpatiotemporalDataset(Dataset):
 
         # Extract features
         spatial_coords = tile_data[['longitude', 'latitude']].values
-        temporal_encoding = np.stack(tile_data['temporal_encoding'].values)
         embeddings = np.stack(tile_data['embedding_patch'].values)
         agbd = tile_data['agbd'].values[:, None]
 
@@ -446,8 +450,12 @@ class GEDISpatiotemporalDataset(Dataset):
             spatial_coords = spatial_coords + np.random.normal(0, self.coord_noise_std, spatial_coords.shape)
             spatial_coords = np.clip(spatial_coords, 0, 1)
 
-        # Combine spatial and temporal into full coordinate vector
-        coords = np.concatenate([spatial_coords, temporal_encoding], axis=1)
+        # Build coordinate vector: spatial only or spatiotemporal
+        if self.include_temporal:
+            temporal_encoding = np.stack(tile_data['temporal_encoding'].values)
+            coords = np.concatenate([spatial_coords, temporal_encoding], axis=1)
+        else:
+            coords = spatial_coords
 
         if self.normalize_agbd:
             agbd = normalize_agbd(agbd, self.agbd_scale, self.log_transform_agbd)
@@ -459,6 +467,223 @@ class GEDISpatiotemporalDataset(Dataset):
         target_coords = coords[target_indices]
         target_embeddings = embeddings[target_indices]
         target_agbd = agbd[target_indices]
+
+        return {
+            'context_coords': torch.from_numpy(context_coords).float(),
+            'context_embeddings': torch.from_numpy(context_embeddings).float(),
+            'context_agbd': torch.from_numpy(context_agbd).float(),
+            'target_coords': torch.from_numpy(target_coords).float(),
+            'target_embeddings': torch.from_numpy(target_embeddings).float(),
+            'target_agbd': torch.from_numpy(target_agbd).float(),
+        }
+
+
+class CrossYearSpatiotemporalDataset(Dataset):
+    """
+    Dataset for cross-year spatiotemporal training.
+
+    Instead of random context/target splits, this dataset enforces YEAR-based splits:
+    - For each tile, randomly select a "held-out" year
+    - Context: observations from OTHER years
+    - Target: observations from the held-out year
+
+    This trains the model to predict one year's AGBD given observations from other years,
+    which is exactly the task evaluated with --temporal_context.
+
+    This addresses the training/evaluation mismatch where standard training mixes all years
+    in both context and target, but evaluation uses train years as context for test year targets.
+    """
+
+    def __init__(
+        self,
+        data_df: pd.DataFrame,
+        min_shots_per_tile: int = 10,
+        max_shots_per_tile: Optional[int] = None,
+        min_years_per_tile: int = 2,
+        max_context_shots: Optional[int] = None,
+        max_target_shots: Optional[int] = None,
+        normalize_coords: bool = True,
+        normalize_agbd: bool = True,
+        agbd_scale: float = 200.0,
+        log_transform_agbd: bool = True,
+        augment_coords: bool = True,
+        coord_noise_std: float = 0.01,
+        global_bounds: Optional[Tuple[float, float, float, float]] = None,
+        temporal_bounds: Optional[Tuple[float, float]] = None,
+        time_column: str = 'time',
+        include_temporal: bool = True
+    ):
+        """
+        Initialize cross-year spatiotemporal dataset.
+
+        Args:
+            data_df: DataFrame with GEDI observations
+            min_shots_per_tile: Minimum shots per tile
+            max_shots_per_tile: Maximum shots per tile
+            min_years_per_tile: Minimum number of years required per tile (need at least 2)
+            max_context_shots: Max context shots to return (subsampled BEFORE tensor creation)
+            max_target_shots: Max target shots to return (subsampled BEFORE tensor creation)
+            normalize_coords: Normalize coordinates
+            normalize_agbd: Normalize AGBD
+            agbd_scale: AGBD normalization scale
+            log_transform_agbd: Apply log transform
+            augment_coords: Add coordinate noise
+            coord_noise_std: Coordinate noise std
+            global_bounds: Spatial bounds for normalization
+            temporal_bounds: Temporal bounds for normalization
+            time_column: Timestamp column name
+            include_temporal: Include temporal encoding in coordinates
+        """
+        self.data_df = data_df[data_df['embedding_patch'].notna()].copy()
+        self.time_column = time_column
+        self.include_temporal = include_temporal
+        self.min_years_per_tile = min_years_per_tile
+
+        if time_column not in self.data_df.columns:
+            raise ValueError(f"Time column '{time_column}' not found in dataframe")
+
+        # Add year column
+        self.data_df['_year'] = pd.to_datetime(self.data_df[time_column]).dt.year
+
+        # Compute temporal bounds
+        timestamps = pd.to_datetime(self.data_df[time_column])
+        unix_time = timestamps.astype(np.int64) / 1e9
+        if temporal_bounds is None:
+            self.temporal_bounds = (unix_time.min(), unix_time.max())
+        else:
+            self.temporal_bounds = temporal_bounds
+
+        # Precompute temporal encoding
+        self.data_df['temporal_encoding'] = list(compute_temporal_encoding(
+            self.data_df[time_column],
+            self.temporal_bounds
+        ))
+
+        # Group by tiles, keeping only those with multiple years
+        self.tiles = []
+        self.tile_years = []  # Track available years per tile
+        skipped_single_year = 0
+
+        for tile_id, group in self.data_df.groupby('tile_id'):
+            years_in_tile = group['_year'].unique()
+            if len(years_in_tile) < min_years_per_tile:
+                skipped_single_year += 1
+                continue
+
+            if len(group) >= min_shots_per_tile:
+                if max_shots_per_tile and len(group) > max_shots_per_tile:
+                    group = group.sample(n=max_shots_per_tile, random_state=42)
+                self.tiles.append(group)
+                self.tile_years.append(list(years_in_tile))
+
+        self.min_shots_per_tile = min_shots_per_tile
+        self.max_shots_per_tile = max_shots_per_tile
+        self.max_context_shots = max_context_shots
+        self.max_target_shots = max_target_shots
+        self.normalize_coords = normalize_coords
+        self.normalize_agbd = normalize_agbd
+        self.agbd_scale = agbd_scale
+        self.log_transform_agbd = log_transform_agbd
+        self.augment_coords = augment_coords
+        self.coord_noise_std = coord_noise_std
+
+        if global_bounds is None:
+            self.lon_min = self.data_df['longitude'].min()
+            self.lon_max = self.data_df['longitude'].max()
+            self.lat_min = self.data_df['latitude'].min()
+            self.lat_max = self.data_df['latitude'].max()
+        else:
+            self.lon_min, self.lat_min, self.lon_max, self.lat_max = global_bounds
+
+        mode = "spatiotemporal (5D)" if include_temporal else "spatial-only (2D)"
+        ctx_limit = f", max_ctx={max_context_shots}" if max_context_shots else ""
+        tgt_limit = f", max_tgt={max_target_shots}" if max_target_shots else ""
+        print(f"CrossYear dataset: {len(self.tiles)} tiles with ≥{min_years_per_tile} years, coords: {mode}{ctx_limit}{tgt_limit}")
+        print(f"  Skipped {skipped_single_year} single-year tiles")
+        if len(self.tiles) > 0:
+            shots_per_tile = [len(t) for t in self.tiles]
+            years_per_tile = [len(y) for y in self.tile_years]
+            print(f"  Shots/tile: min={min(shots_per_tile)}, max={max(shots_per_tile)}, mean={np.mean(shots_per_tile):.1f}")
+            print(f"  Years/tile: min={min(years_per_tile)}, max={max(years_per_tile)}, mean={np.mean(years_per_tile):.1f}")
+
+    def __len__(self) -> int:
+        return len(self.tiles)
+
+    def _normalize_coordinates(self, coords: np.ndarray) -> np.ndarray:
+        global_bounds = (self.lon_min, self.lat_min, self.lon_max, self.lat_max)
+        return normalize_coords(coords, global_bounds)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """
+        Get a cross-year training sample.
+
+        Randomly selects one year as target, uses remaining years as context.
+        Subsamples BEFORE creating numpy arrays to avoid memory issues with large tiles.
+        """
+        tile_data = self.tiles[idx].copy()
+        tile_years = self.tile_years[idx]
+
+        # Randomly select held-out year for target
+        target_year = random.choice(tile_years)
+        context_years = [y for y in tile_years if y != target_year]
+
+        # Split by year
+        target_mask = tile_data['_year'] == target_year
+        context_mask = tile_data['_year'].isin(context_years)
+
+        context_data = tile_data[context_mask]
+        target_data = tile_data[target_mask]
+
+        # Handle edge case where one set is empty (shouldn't happen with min_years_per_tile=2)
+        if len(context_data) == 0 or len(target_data) == 0:
+            # Fallback to random 50/50 split
+            n = len(tile_data)
+            indices = list(range(n))
+            random.shuffle(indices)
+            mid = n // 2
+            context_data = tile_data.iloc[indices[:max(1, mid)]]
+            target_data = tile_data.iloc[indices[mid:]]
+
+        # Subsample BEFORE np.stack to avoid memory issues with large tiles
+        if self.max_context_shots and len(context_data) > self.max_context_shots:
+            context_data = context_data.sample(n=self.max_context_shots)
+        if self.max_target_shots and len(target_data) > self.max_target_shots:
+            target_data = target_data.sample(n=self.max_target_shots)
+
+        # Extract features for context (now working with subsampled data)
+        context_spatial = context_data[['longitude', 'latitude']].values
+        context_embeddings = np.stack(context_data['embedding_patch'].values)
+        context_agbd = context_data['agbd'].values[:, None]
+
+        # Extract features for targets (now working with subsampled data)
+        target_spatial = target_data[['longitude', 'latitude']].values
+        target_embeddings = np.stack(target_data['embedding_patch'].values)
+        target_agbd = target_data['agbd'].values[:, None]
+
+        # Normalize spatial coordinates
+        if self.normalize_coords:
+            context_spatial = self._normalize_coordinates(context_spatial)
+            target_spatial = self._normalize_coordinates(target_spatial)
+
+        if self.augment_coords:
+            context_spatial = context_spatial + np.random.normal(
+                0, self.coord_noise_std, context_spatial.shape)
+            context_spatial = np.clip(context_spatial, 0, 1)
+
+        # Build coordinate vector
+        if self.include_temporal:
+            context_temporal = np.stack(context_data['temporal_encoding'].values)
+            target_temporal = np.stack(target_data['temporal_encoding'].values)
+            context_coords = np.concatenate([context_spatial, context_temporal], axis=1)
+            target_coords = np.concatenate([target_spatial, target_temporal], axis=1)
+        else:
+            context_coords = context_spatial
+            target_coords = target_spatial
+
+        # Normalize AGBD
+        if self.normalize_agbd:
+            context_agbd = normalize_agbd(context_agbd, self.agbd_scale, self.log_transform_agbd)
+            target_agbd = normalize_agbd(target_agbd, self.agbd_scale, self.log_transform_agbd)
 
         return {
             'context_coords': torch.from_numpy(context_coords).float(),

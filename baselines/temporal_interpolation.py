@@ -31,6 +31,11 @@ from models.neural_process import GEDINeuralProcess, neural_process_loss
 from utils.config import save_config, _make_serializable
 from utils.evaluation import evaluate_model, compute_calibration_metrics
 from utils.normalization import normalize_coords, normalize_agbd, denormalize_agbd, denormalize_std
+from utils.disturbance import (
+    compute_disturbance_analysis,
+    print_disturbance_analysis,
+    print_stratified_r2
+)
 
 
 def parse_args():
@@ -44,12 +49,16 @@ def parse_args():
 
     parser.add_argument('--region_bbox', type=float, nargs=4, required=True,
                         help='Region bounding box')
+    parser.add_argument('--fire_shapefile', type=str, default=None,
+                        help='Optional: Path to fire boundary shapefile (.shp) to filter GEDI shots')
     parser.add_argument('--pre_years', type=int, nargs='+', required=True,
                         help='Years before event (e.g., 2019 2020)')
     parser.add_argument('--post_years', type=int, nargs='+', required=True,
                         help='Years after event (e.g., 2022 2023)')
     parser.add_argument('--test_year', type=int, required=True,
                         help='Event year to test on (e.g., 2021)')
+    parser.add_argument('--test_months', type=int, nargs='+', default=None,
+                        help='Optional: Filter test year to specific months (e.g., 8 9 10 11 12 for Aug-Dec)')
     parser.add_argument('--output_dir', type=str, required=True,
                         help='Output directory')
 
@@ -83,6 +92,38 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def filter_shots_by_shapefile(df: pd.DataFrame, shapefile_path: str) -> pd.DataFrame:
+    """Filter GEDI shots to those inside a shapefile boundary."""
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    gdf = gpd.read_file(shapefile_path)
+    print(f"  Shapefile CRS: {gdf.crs}")
+    print(f"  Shapefile bounds (original): {gdf.total_bounds}")
+
+    if gdf.crs is None:
+        gdf = gdf.set_crs('EPSG:4326')
+    elif gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs('EPSG:4326')
+
+    print(f"  Shapefile bounds (WGS84): {gdf.total_bounds}")
+    print(f"  GEDI lon range: [{df['longitude'].min():.4f}, {df['longitude'].max():.4f}]")
+    print(f"  GEDI lat range: [{df['latitude'].min():.4f}, {df['latitude'].max():.4f}]")
+
+    points = gpd.GeoSeries(
+        [Point(lon, lat) for lon, lat in zip(df['longitude'], df['latitude'])],
+        crs='EPSG:4326'
+    )
+
+    geometry = gdf.union_all() if hasattr(gdf, 'union_all') else gdf.unary_union
+    within_mask = points.within(geometry)
+
+    filtered_df = df[within_mask.values].copy()
+    print(f"Filtered to {len(filtered_df)} shots inside fire perimeter (from {len(df)})")
+
+    return filtered_df
 
 
 def train_spatial_model(
@@ -340,225 +381,6 @@ def predict_with_tile_context(
     return predictions, uncertainties
 
 
-def compute_disturbance_analysis(
-    gedi_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    predictions: np.ndarray,
-    pre_years: list,
-    post_years: list,
-    test_year: int
-) -> dict:
-    """
-    Compute per-tile disturbance metrics and correlate with prediction errors.
-
-    Disturbance intensity = (expected - observed) / expected
-    where expected = (pre_mean + post_mean) / 2
-
-    Returns dict with:
-    - per_tile: DataFrame with tile-level metrics
-    - correlation: Pearson correlation between disturbance and abs error
-    - summary: Aggregate statistics
-    - stratified_r2: R² computed separately for stable vs fire tiles
-    """
-    from scipy import stats
-    from sklearn.metrics import r2_score
-
-    # Get test tiles
-    test_tiles = test_df['tile_id'].unique()
-
-    # Compute per-tile statistics
-    tile_stats = []
-    for tile_id in test_tiles:
-        # Pre-event mean for this tile
-        pre_data = gedi_df[(gedi_df['tile_id'] == tile_id) &
-                           (gedi_df['year'].isin(pre_years))]
-        pre_mean = pre_data['agbd'].mean() if len(pre_data) > 0 else np.nan
-
-        # Post-event mean for this tile
-        post_data = gedi_df[(gedi_df['tile_id'] == tile_id) &
-                            (gedi_df['year'].isin(post_years))]
-        post_mean = post_data['agbd'].mean() if len(post_data) > 0 else np.nan
-
-        # Test year mean for this tile
-        test_tile_df = test_df[test_df['tile_id'] == tile_id]
-        test_mean = test_tile_df['agbd'].mean()
-        n_test_shots = len(test_tile_df)
-
-        # Prediction error for this tile
-        tile_mask = test_df['tile_id'] == tile_id
-        tile_preds = predictions[tile_mask.values]
-        tile_targets = test_tile_df['agbd'].values
-        tile_rmse = np.sqrt(np.mean((tile_preds - tile_targets) ** 2))
-        tile_mae = np.mean(np.abs(tile_preds - tile_targets))
-
-        # Expected value (linear interpolation assumption)
-        if not np.isnan(pre_mean) and not np.isnan(post_mean):
-            expected = (pre_mean + post_mean) / 2
-            # Disturbance intensity: positive = biomass loss
-            disturbance = (expected - test_mean) / expected if expected > 0 else 0
-            # Relative change from pre
-            change_from_pre = (pre_mean - test_mean) / pre_mean if pre_mean > 0 else 0
-        else:
-            expected = np.nan
-            disturbance = np.nan
-            change_from_pre = np.nan
-
-        tile_stats.append({
-            'tile_id': tile_id,
-            'pre_mean': pre_mean,
-            'post_mean': post_mean,
-            'test_mean': test_mean,
-            'expected': expected,
-            'disturbance': disturbance,
-            'change_from_pre': change_from_pre,
-            'tile_rmse': tile_rmse,
-            'tile_mae': tile_mae,
-            'n_test_shots': n_test_shots,
-            'n_pre_shots': len(pre_data),
-            'n_post_shots': len(post_data)
-        })
-
-    tile_df = pd.DataFrame(tile_stats)
-
-    # Compute correlation between disturbance and error
-    valid_mask = ~(tile_df['disturbance'].isna() | tile_df['tile_rmse'].isna())
-    if valid_mask.sum() >= 3:
-        corr, p_value = stats.pearsonr(
-            tile_df.loc[valid_mask, 'disturbance'],
-            tile_df.loc[valid_mask, 'tile_rmse']
-        )
-    else:
-        corr, p_value = np.nan, np.nan
-
-    # Compute quartile breakdown
-    valid_tiles = tile_df[valid_mask].copy()
-    if len(valid_tiles) >= 4:
-        valid_tiles['disturbance_quartile'] = pd.qcut(
-            valid_tiles['disturbance'], q=4, labels=['Q1_low', 'Q2', 'Q3', 'Q4_high']
-        )
-        quartile_rmse = valid_tiles.groupby('disturbance_quartile')['tile_rmse'].mean().to_dict()
-    else:
-        quartile_rmse = {}
-
-    # Compute stratified R² by disturbance level
-    # Stable tiles: disturbance < 0.2 (less than 20% biomass change)
-    # Fire tiles: disturbance > 0.5 (more than 50% biomass loss)
-    stratified_r2 = _compute_stratified_r2(test_df, predictions, tile_df)
-
-    return {
-        'per_tile': tile_df.to_dict('records'),
-        'correlation': {
-            'pearson_r': float(corr) if not np.isnan(corr) else None,
-            'p_value': float(p_value) if not np.isnan(p_value) else None
-        },
-        'quartile_rmse': {k: float(v) for k, v in quartile_rmse.items()},
-        'stratified_r2': stratified_r2,
-        'summary': {
-            'mean_disturbance': float(tile_df['disturbance'].mean()),
-            'std_disturbance': float(tile_df['disturbance'].std()),
-            'n_tiles_with_loss': int((tile_df['disturbance'] > 0).sum()),
-            'n_tiles_with_gain': int((tile_df['disturbance'] < 0).sum()),
-            'pct_tiles_major_loss': float((tile_df['disturbance'] > 0.3).mean() * 100),
-            'mean_change_from_pre': float(tile_df['change_from_pre'].mean())
-        }
-    }
-
-
-def _compute_stratified_r2(
-    test_df: pd.DataFrame,
-    predictions: np.ndarray,
-    tile_df: pd.DataFrame
-) -> dict:
-    """
-    Compute R² separately for stable forest vs fire-affected tiles.
-
-    Stratification:
-    - Stable tiles: disturbance < 0.2 (less than 20% biomass change)
-    - Fire tiles: disturbance > 0.5 (more than 50% biomass loss)
-
-    This helps reveal that baselines fail on disturbance while the
-    spatiotemporal model maintains performance on fire-affected areas.
-    """
-    from sklearn.metrics import r2_score
-
-    # Create tile_id -> disturbance mapping
-    tile_disturbance = dict(zip(tile_df['tile_id'], tile_df['disturbance']))
-
-    # Add disturbance to test_df
-    test_disturbance = test_df['tile_id'].map(tile_disturbance)
-
-    # Stable tiles: disturbance < 0.2
-    stable_mask = (test_disturbance < 0.2) & (~test_disturbance.isna())
-    stable_mask = stable_mask.values
-
-    # Fire tiles: disturbance > 0.5 (50% biomass loss)
-    fire_mask = (test_disturbance > 0.5) & (~test_disturbance.isna())
-    fire_mask = fire_mask.values
-
-    # Also compute for moderate disturbance (0.2 <= dist <= 0.5)
-    moderate_mask = (test_disturbance >= 0.2) & (test_disturbance <= 0.5) & (~test_disturbance.isna())
-    moderate_mask = moderate_mask.values
-
-    results = {
-        'stable': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
-        'fire': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
-        'moderate': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0}
-    }
-
-    targets = test_df['agbd'].values
-
-    # Stable tiles
-    if stable_mask.sum() >= 10:  # Need enough samples for meaningful R²
-        stable_preds = predictions[stable_mask]
-        stable_targets = targets[stable_mask]
-        # Filter out NaN predictions
-        valid = ~np.isnan(stable_preds)
-        if valid.sum() >= 10:
-            r2 = r2_score(stable_targets[valid], stable_preds[valid])
-            rmse = np.sqrt(np.mean((stable_preds[valid] - stable_targets[valid]) ** 2))
-            n_stable_tiles = test_df.loc[stable_mask, 'tile_id'].nunique()
-            results['stable'] = {
-                'r2': float(r2),
-                'rmse': float(rmse),
-                'n_shots': int(valid.sum()),
-                'n_tiles': int(n_stable_tiles)
-            }
-
-    # Fire tiles
-    if fire_mask.sum() >= 10:
-        fire_preds = predictions[fire_mask]
-        fire_targets = targets[fire_mask]
-        valid = ~np.isnan(fire_preds)
-        if valid.sum() >= 10:
-            r2 = r2_score(fire_targets[valid], fire_preds[valid])
-            rmse = np.sqrt(np.mean((fire_preds[valid] - fire_targets[valid]) ** 2))
-            n_fire_tiles = test_df.loc[fire_mask, 'tile_id'].nunique()
-            results['fire'] = {
-                'r2': float(r2),
-                'rmse': float(rmse),
-                'n_shots': int(valid.sum()),
-                'n_tiles': int(n_fire_tiles)
-            }
-
-    # Moderate disturbance tiles
-    if moderate_mask.sum() >= 10:
-        mod_preds = predictions[moderate_mask]
-        mod_targets = targets[moderate_mask]
-        valid = ~np.isnan(mod_preds)
-        if valid.sum() >= 10:
-            r2 = r2_score(mod_targets[valid], mod_preds[valid])
-            rmse = np.sqrt(np.mean((mod_preds[valid] - mod_targets[valid]) ** 2))
-            n_mod_tiles = test_df.loc[moderate_mask, 'tile_id'].nunique()
-            results['moderate'] = {
-                'r2': float(r2),
-                'rmse': float(rmse),
-                'n_shots': int(valid.sum()),
-                'n_tiles': int(n_mod_tiles)
-            }
-
-    return results
-
-
 def temporal_interpolation(
     pred_pre: np.ndarray,
     pred_post: np.ndarray,
@@ -635,6 +457,14 @@ def main():
     gedi_df['year'] = pd.to_datetime(gedi_df['time']).dt.year
     print(f"Retrieved {len(gedi_df)} shots")
 
+    # Apply fire shapefile filter if specified
+    if args.fire_shapefile:
+        print(f"\nApplying fire perimeter filter from: {args.fire_shapefile}")
+        gedi_df = filter_shots_by_shapefile(gedi_df, args.fire_shapefile)
+        if len(gedi_df) == 0:
+            print("No GEDI shots inside fire perimeter. Exiting.")
+            return
+
     # Extract embeddings (reuse same extractor to avoid reinitializing GeoTessera)
     print("\nExtracting embeddings...")
     extractor = EmbeddingExtractor(year=all_years[0], embeddings_dir=args.embeddings_dir)
@@ -657,6 +487,14 @@ def main():
         buffer_size=0.1, random_state=args.seed
     )
     train_df_full, val_df_full, test_df = splitter.split()
+
+    # Filter test data to specific months if specified
+    if args.test_months:
+        test_df['month'] = pd.to_datetime(test_df['time']).dt.month
+        original_count = len(test_df)
+        test_df = test_df[test_df['month'].isin(args.test_months)].copy()
+        test_df = test_df.drop(columns=['month'])
+        print(f"Filtered test data to months {args.test_months}: {len(test_df)} shots (from {original_count})")
 
     # Split train data into pre and post
     pre_train_df = train_df_full[train_df_full['year'].isin(args.pre_years)]
@@ -780,10 +618,10 @@ def main():
     # UQ calibration metrics (in log space)
     calibration = compute_calibration_metrics(valid_pred_log, valid_target_log, valid_unc_log)
 
-    # Disturbance analysis
+    # Disturbance analysis (using shared utility)
     disturbance_analysis = compute_disturbance_analysis(
-        gedi_df, test_df, pred_final_linear,
-        args.pre_years, args.post_years, args.test_year
+        gedi_df, test_df, args.pre_years, args.post_years, args.test_year,
+        predictions=pred_final_linear
     )
 
     print("\n" + "=" * 80)
@@ -803,36 +641,12 @@ def main():
     print(f"  Coverage 2σ:  {calibration['coverage_2sigma']:.1f}% (ideal: 95.4%)")
     print(f"  Coverage 3σ:  {calibration['coverage_3sigma']:.1f}% (ideal: 99.7%)")
 
-    print(f"\nDisturbance Analysis:")
-    print(f"  Mean disturbance: {disturbance_analysis['summary']['mean_disturbance']:.1%}")
-    print(f"  Tiles with biomass loss: {disturbance_analysis['summary']['n_tiles_with_loss']}")
-    print(f"  Tiles with major loss (>30%): {disturbance_analysis['summary']['pct_tiles_major_loss']:.1f}%")
-    if disturbance_analysis['correlation']['pearson_r'] is not None:
-        print(f"  Error-disturbance correlation: r={disturbance_analysis['correlation']['pearson_r']:.3f} "
-              f"(p={disturbance_analysis['correlation']['p_value']:.3f})")
-    if disturbance_analysis['quartile_rmse']:
-        print(f"  RMSE by disturbance quartile:")
-        for q, rmse_val in disturbance_analysis['quartile_rmse'].items():
-            print(f"    {q}: {rmse_val:.2f} Mg/ha")
+    # Print disturbance analysis using shared utility
+    print_disturbance_analysis(disturbance_analysis, indent="  ")
 
-    # Print stratified R² (key insight: baseline fails on fire tiles)
-    strat = disturbance_analysis['stratified_r2']
-    print(f"\nStratified R² by Disturbance Level:")
-    if strat['stable']['r2'] is not None:
-        print(f"  Stable tiles (<20% change):  R²={strat['stable']['r2']:.4f}, "
-              f"RMSE={strat['stable']['rmse']:.2f} Mg/ha ({strat['stable']['n_shots']} shots, {strat['stable']['n_tiles']} tiles)")
-    else:
-        print(f"  Stable tiles (<20% change):  Not enough data")
-    if strat['moderate']['r2'] is not None:
-        print(f"  Moderate (20-50% change):    R²={strat['moderate']['r2']:.4f}, "
-              f"RMSE={strat['moderate']['rmse']:.2f} Mg/ha ({strat['moderate']['n_shots']} shots, {strat['moderate']['n_tiles']} tiles)")
-    else:
-        print(f"  Moderate (20-50% change):    Not enough data")
-    if strat['fire']['r2'] is not None:
-        print(f"  Fire tiles (>50% loss):      R²={strat['fire']['r2']:.4f}, "
-              f"RMSE={strat['fire']['rmse']:.2f} Mg/ha ({strat['fire']['n_shots']} shots, {strat['fire']['n_tiles']} tiles)")
-    else:
-        print(f"  Fire tiles (>50% loss):      Not enough data")
+    # Print stratified R² using shared utility
+    if 'stratified_r2' in disturbance_analysis:
+        print_stratified_r2(disturbance_analysis['stratified_r2'], indent="  ")
 
     # Save results
     results = {

@@ -355,6 +355,36 @@ class GEDINeuralProcess(nn.Module):
             output_uncertainty=output_uncertainty
         )
 
+    def encode_context(
+        self,
+        context_coords: torch.Tensor,
+        context_embeddings: torch.Tensor,
+        context_agbd: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encode context once for reuse across multiple target chunks.
+
+        This is useful for memory-efficient processing of large tiles where
+        we want to process targets in chunks while keeping context fixed.
+
+        Args:
+            context_coords: (n_context, coord_dim) context coordinates
+            context_embeddings: (n_context, patch_size, patch_size, channels) raw embeddings
+            context_agbd: (n_context, 1) context AGBD values
+
+        Returns:
+            (context_emb_features, context_repr):
+            - context_emb_features: (n_context, embedding_feature_dim) encoded embeddings
+            - context_repr: (n_context, context_repr_dim) full context representation
+        """
+        context_emb_features = self.embedding_encoder(context_embeddings)
+        context_repr = self.context_encoder(
+            context_coords,
+            context_emb_features,
+            context_agbd
+        )
+        return context_emb_features, context_repr
+
     def forward(
         self,
         context_coords: torch.Tensor,
@@ -363,19 +393,23 @@ class GEDINeuralProcess(nn.Module):
         query_coords: torch.Tensor,
         query_embeddings: torch.Tensor,
         query_agbd: Optional[torch.Tensor] = None,
-        training: bool = True
+        training: bool = True,
+        context_encoded: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Forward pass.
 
         Args:
-            context_coords: (n_context, 2)
-            context_embeddings: (n_context, patch_size, patch_size, channels)
-            context_agbd: (n_context, 1)
-            query_coords: (n_query, 2)
+            context_coords: (n_context, coord_dim) - can be None if context_encoded provided
+            context_embeddings: (n_context, patch_size, patch_size, channels) - can be None if context_encoded provided
+            context_agbd: (n_context, 1) - can be None if context_encoded provided
+            query_coords: (n_query, coord_dim)
             query_embeddings: (n_query, patch_size, patch_size, channels)
             query_agbd: (n_query, 1) or None (only needed during training for ANP)
             training: Whether in training mode (affects latent sampling)
+            context_encoded: Optional pre-encoded context from encode_context().
+                            If provided, context_coords/embeddings/agbd are ignored for encoding
+                            but context_coords is still needed for the latent path.
 
         Returns:
             (predicted_agbd, log_variance, z_mu_context, z_log_sigma_context, z_mu_all, z_log_sigma_all)
@@ -386,16 +420,19 @@ class GEDINeuralProcess(nn.Module):
             - z_mu_all: (1, latent_dim) or None - p(z|C,T) distribution mean (training only)
             - z_log_sigma_all: (1, latent_dim) or None - p(z|C,T) distribution log std (training only)
         """
-        # encode embeddings
-        context_emb_features = self.embedding_encoder(context_embeddings)
-        query_emb_features = self.embedding_encoder(query_embeddings)
+        # Use pre-encoded context if provided, otherwise encode now
+        if context_encoded is not None:
+            context_emb_features, context_repr = context_encoded
+        else:
+            context_emb_features = self.embedding_encoder(context_embeddings)
+            context_repr = self.context_encoder(
+                context_coords,
+                context_emb_features,
+                context_agbd
+            )
 
-        # encode context points
-        context_repr = self.context_encoder(
-            context_coords,
-            context_emb_features,
-            context_agbd
-        )
+        # Encode query embeddings
+        query_emb_features = self.embedding_encoder(query_embeddings)
 
         z_mu_context, z_log_sigma_context = None, None
         z_mu_all, z_log_sigma_all = None, None

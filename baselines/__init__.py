@@ -1,3 +1,5 @@
 """Baseline models for spatiotemporal biomass prediction."""
 
-__all__ = []
+from baselines.models import QuantileRandomForest, QuantileXGBoost
+
+__all__ = ["QuantileRandomForest", "QuantileXGBoost"]

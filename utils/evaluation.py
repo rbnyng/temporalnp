@@ -251,6 +251,7 @@ def evaluate_model(
         'log_r2': log_metrics['r2'],
         'linear_rmse': linear_metrics['rmse'],
         'linear_mae': linear_metrics['mae'],
+        'linear_r2': linear_metrics['r2'],
     }
 
     if 'mean_uncertainty' in log_metrics:
