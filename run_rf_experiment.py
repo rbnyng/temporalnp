@@ -401,7 +401,8 @@ def run_single_seed(
         gedi_df, test_df, pre_years, post_years, args.test_year,
         predictions=pred_linear,
         predictions_log=pred_log,
-        targets_log=y_test_log.ravel()
+        targets_log=y_test_log.ravel(),
+        uncertainties_log=unc_log
     )
 
     # Save model
@@ -416,6 +417,7 @@ def run_single_seed(
     # Log-space values for stratified metrics (consistent with training)
     test_df_out['pred_log'] = pred_log
     test_df_out['agbd_log'] = y_test_log.ravel()
+    test_df_out['unc_log'] = unc_log
     test_df_out.to_parquet(seed_output_dir / 'test_predictions.parquet')
 
     # Save tile disturbance

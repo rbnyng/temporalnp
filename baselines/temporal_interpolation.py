@@ -623,7 +623,8 @@ def main():
         gedi_df, test_df, args.pre_years, args.post_years, args.test_year,
         predictions=pred_final_linear,
         predictions_log=pred_final,
-        targets_log=target_log
+        targets_log=target_log,
+        uncertainties_log=unc_final
     )
 
     print("\n" + "=" * 80)

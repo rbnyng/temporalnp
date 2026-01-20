@@ -1023,7 +1023,8 @@ def main():
         gedi_df, test_df, pre_years, post_years, args.test_year,
         predictions=test_preds_linear,
         predictions_log=test_preds_log,
-        targets_log=targets_log
+        targets_log=targets_log,
+        uncertainties_log=test_unc_log
     )
 
     # Print disturbance analysis using shared utility
@@ -1045,6 +1046,7 @@ def main():
     # Log-space values for stratified metrics (consistent with training)
     test_df_out['pred_log'] = test_preds_log
     test_df_out['agbd_log'] = normalize_agbd(test_df['agbd'].values)
+    test_df_out['unc_log'] = test_unc_log if test_unc_log is not None else np.nan
     test_df_out.to_parquet(output_dir / 'test_predictions.parquet')
 
     # Save final results
