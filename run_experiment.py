@@ -25,9 +25,8 @@ from datetime import datetime
 import numpy as np
 
 from utils.disturbance import (
-    aggregate_stratified_r2,
-    print_aggregated_stratified_r2,
-    compute_pooled_stratified_r2
+    compute_pooled_stratified_r2,
+    print_stratified_r2
 )
 
 # Get project root directory for PYTHONPATH
@@ -67,8 +66,8 @@ def parse_args():
                         help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=16,
                         help='Batch size')
-    parser.add_argument('--max_context_shots', type=int, default=1024,
-                        help='Maximum context shots per tile (runtime subsampling)')
+    parser.add_argument('--max_context_shots', type=int, default=10000,
+                        help='Maximum context shots per tile (chunked if needed)')
     parser.add_argument('--max_target_shots', type=int, default=1024,
                         help='Maximum target shots per tile (runtime subsampling)')
     parser.add_argument('--no_temporal_encoding', action='store_true',
@@ -189,9 +188,6 @@ def aggregate_results(all_results: list) -> dict:
     error_disturbance_corr = [r['disturbance']['correlation']['pearson_r']
                                for r in successful if r.get('disturbance') and r['disturbance'].get('correlation') and r['disturbance']['correlation'].get('pearson_r') is not None]
 
-    # Use shared utility for stratified R² aggregation
-    stratified_r2_agg = aggregate_stratified_r2(successful)
-
     aggregated = {
         'n_seeds': len(all_results),
         'n_successful': len(successful),
@@ -264,8 +260,7 @@ def aggregate_results(all_results: list) -> dict:
                 'std': float(np.std(error_disturbance_corr)) if error_disturbance_corr else None,
                 'values': error_disturbance_corr
             }
-        },
-        'stratified_r2': stratified_r2_agg
+        }
     }
 
     return aggregated
@@ -395,27 +390,11 @@ def main():
         if aggregated['disturbance'].get('error_disturbance_correlation', {}).get('mean') is not None:
             print(f"  Error-disturbance correlation: r={aggregated['disturbance']['error_disturbance_correlation']['mean']:.3f} ± {aggregated['disturbance']['error_disturbance_correlation']['std']:.3f}")
 
-    # Print stratified R² using shared utility (per-seed averaging)
-    if aggregated.get('stratified_r2'):
-        print("\n(Per-seed averaged - see pooled_stratified_r2 for more robust analysis)")
-        print_aggregated_stratified_r2(aggregated['stratified_r2'])
-
-    # Print pooled stratified R² (more robust)
+    # Print pooled stratified metrics (more robust than per-seed averaging)
     if aggregated.get('pooled_stratified_r2') and not aggregated['pooled_stratified_r2'].get('error'):
         pooled = aggregated['pooled_stratified_r2']
-        thresholds = pooled.get('thresholds', {'stable_max': 0.1, 'disturbed_min': 0.3})
-        stable_max = int(thresholds['stable_max'] * 100)
-        disturbed_min = int(thresholds['disturbed_min'] * 100)
-
-        print(f"\nPooled Stratified R² (all seeds combined, {pooled['total_tiles']} tiles, {pooled['total_shots']} shots):")
-        for stratum, label in [('stable', f'Stable (<{stable_max}% change)'),
-                               ('moderate', f'Moderate ({stable_max}-{disturbed_min}%)'),
-                               ('disturbed', f'Disturbed (>{disturbed_min}% loss)')]:
-            s = pooled.get(stratum, {})
-            if s.get('r2') is not None:
-                print(f"  {label:24s} R²={s['r2']:.4f}, RMSE={s['rmse']:.2f} Mg/ha ({s['n_shots']} shots, {s['n_tiles']} tiles)")
-            else:
-                print(f"  {label:24s} Not enough data")
+        print(f"\nPooled across {pooled['total_tiles']} tiles, {pooled['total_shots']} shots:")
+        print_stratified_r2(pooled)
 
     print(f"\nResults saved to: {output_dir}")
 

@@ -18,10 +18,13 @@ def compute_disturbance_analysis(
     predictions: Optional[np.ndarray] = None
 ) -> dict:
     """
-    Compute per-tile disturbance metrics and optionally stratified R².
+    Compute per-tile disturbance metrics.
 
     Disturbance intensity = (expected - observed) / expected
     where expected = (pre_mean + post_mean) / 2, or just pre_mean if no post.
+
+    Note: For stratified metrics by disturbance level, use compute_pooled_stratified_r2()
+    after running experiments across seeds.
 
     Args:
         gedi_df: Full GEDI DataFrame with all years
@@ -29,11 +32,10 @@ def compute_disturbance_analysis(
         pre_years: Years before the event
         post_years: Years after the event
         test_year: The held-out test year
-        predictions: Optional predictions aligned with test_df for error analysis
+        predictions: Optional predictions (linear space) aligned with test_df for error analysis
 
     Returns:
-        Dictionary with per_tile stats, correlation, quartile_rmse,
-        stratified_r2, and summary statistics.
+        Dictionary with per_tile stats, correlation, quartile_rmse, and summary statistics.
     """
     from scipy import stats
 
@@ -106,11 +108,6 @@ def compute_disturbance_analysis(
     # Summary statistics
     valid_mask = ~tile_df['disturbance'].isna()
 
-    # Compute stratified R² if predictions are provided
-    stratified_r2 = None
-    if predictions is not None:
-        stratified_r2 = compute_stratified_r2(test_df, predictions, tile_df)
-
     # Compute correlation between disturbance and error (if predictions provided)
     correlation = {'pearson_r': None, 'p_value': None}
     quartile_rmse = {}
@@ -151,9 +148,6 @@ def compute_disturbance_analysis(
         }
     }
 
-    if stratified_r2 is not None:
-        result['stratified_r2'] = stratified_r2
-
     return result
 
 
@@ -161,7 +155,10 @@ def compute_stratified_r2(
     test_df: pd.DataFrame,
     predictions: np.ndarray,
     tile_df: pd.DataFrame,
-    thresholds: dict = None
+    thresholds: dict = None,
+    predictions_log: Optional[np.ndarray] = None,
+    targets_log: Optional[np.ndarray] = None,
+    uncertainties_log: Optional[np.ndarray] = None
 ) -> dict:
     """
     Compute R² separately for stable forest vs disturbed tiles.
@@ -173,12 +170,15 @@ def compute_stratified_r2(
 
     Args:
         test_df: Test DataFrame with tile_id and agbd columns
-        predictions: Predictions aligned with test_df
+        predictions: Predictions (linear space) aligned with test_df
         tile_df: DataFrame with tile_id and disturbance columns
         thresholds: Optional dict with 'stable_max' and 'disturbed_min' keys
+        predictions_log: Optional log-space predictions (consistent with training)
+        targets_log: Optional log-space targets (consistent with training)
+        uncertainties_log: Optional log-space uncertainties for coverage computation
 
     Returns:
-        Dictionary with r2, rmse, n_shots, n_tiles for each stratum
+        Dictionary with r2, rmse, coverage_3sigma, n_shots, n_tiles for each stratum
     """
     from sklearn.metrics import r2_score
 
@@ -200,32 +200,74 @@ def compute_stratified_r2(
     moderate_mask = ((test_disturbance >= stable_max) & (test_disturbance <= disturbed_min) & (~test_disturbance.isna())).values
     disturbed_mask = ((test_disturbance > disturbed_min) & (~test_disturbance.isna())).values
 
-    results = {
-        'stable': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
-        'moderate': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
-        'disturbed': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
-        'thresholds': thresholds
+    # Use log-space values if provided (consistent with training)
+    use_log_space = predictions_log is not None and targets_log is not None
+    preds_to_use = predictions_log if use_log_space else predictions
+    targets_to_use = targets_log if use_log_space else test_df['agbd'].values
+
+    # Default stratum result structure
+    default_stratum = {
+        'r2': None, 'rmse': None, 'mae': None, 'bias': None,
+        'z_mean': None, 'z_std': None,
+        'coverage_1sigma': None, 'coverage_2sigma': None, 'coverage_3sigma': None,
+        'n_shots': 0, 'n_tiles': 0
     }
 
-    targets = test_df['agbd'].values
+    results = {
+        'stable': default_stratum.copy(),
+        'moderate': default_stratum.copy(),
+        'disturbed': default_stratum.copy(),
+        'thresholds': thresholds,
+        'log_space': use_log_space
+    }
 
     def compute_stratum_metrics(mask, stratum_name):
         if mask.sum() < 10:
             return None
-        stratum_preds = predictions[mask]
-        stratum_targets = targets[mask]
+        stratum_preds = preds_to_use[mask]
+        stratum_targets = targets_to_use[mask]
         valid = ~np.isnan(stratum_preds)
         if valid.sum() < 10:
             return None
-        r2 = r2_score(stratum_targets[valid], stratum_preds[valid])
-        rmse = np.sqrt(np.mean((stratum_preds[valid] - stratum_targets[valid]) ** 2))
+
+        preds_valid = stratum_preds[valid]
+        targets_valid = stratum_targets[valid]
+        errors = preds_valid - targets_valid
+
+        # Core metrics
+        r2 = r2_score(targets_valid, preds_valid)
+        rmse = np.sqrt(np.mean(errors ** 2))
+        mae = np.mean(np.abs(errors))
+        bias = np.mean(errors)
         n_tiles = test_df.loc[mask, 'tile_id'].nunique()
-        return {
+
+        result = {
             'r2': float(r2),
             'rmse': float(rmse),
+            'mae': float(mae),
+            'bias': float(bias),
             'n_shots': int(valid.sum()),
             'n_tiles': int(n_tiles)
         }
+
+        # Compute calibration metrics if uncertainties provided
+        if uncertainties_log is not None:
+            stratum_unc = uncertainties_log[mask]
+            valid_unc = valid & ~np.isnan(stratum_unc)
+            if valid_unc.sum() >= 10:
+                unc = stratum_unc[valid_unc]
+                p = stratum_preds[valid_unc]
+                t = stratum_targets[valid_unc]
+                z_scores = (t - p) / (unc + 1e-8)
+                abs_z = np.abs(z_scores)
+
+                result['z_mean'] = float(np.mean(z_scores))
+                result['z_std'] = float(np.std(z_scores))
+                result['coverage_1sigma'] = float(np.sum(abs_z <= 1.0) / len(z_scores) * 100)
+                result['coverage_2sigma'] = float(np.sum(abs_z <= 2.0) / len(z_scores) * 100)
+                result['coverage_3sigma'] = float(np.sum(abs_z <= 3.0) / len(z_scores) * 100)
+
+        return result
 
     stable_result = compute_stratum_metrics(stable_mask, 'stable')
     if stable_result:
@@ -271,28 +313,31 @@ def print_stratified_r2(stratified_r2: dict, indent: str = "  ") -> None:
     stable_max = int(thresholds['stable_max'] * 100)
     disturbed_min = int(thresholds['disturbed_min'] * 100)
 
-    print(f"\n{indent}Stratified R² by Disturbance Level:")
+    log_space = stratified_r2.get('log_space', False)
+    space_label = " (log space)" if log_space else ""
+    print(f"\n{indent}Stratified Metrics by Disturbance Level{space_label}:")
+
+    def print_stratum(s, label):
+        print(f"{indent}  {label} ({s['n_shots']} shots, {s['n_tiles']} tiles):")
+        print(f"{indent}    R²={s['r2']:.4f}, RMSE={s['rmse']:.4f}, MAE={s.get('mae', 0):.4f}, Bias={s.get('bias', 0):.4f}")
+        if s.get('coverage_3sigma') is not None:
+            print(f"{indent}    Coverage: 1σ={s['coverage_1sigma']:.1f}%, 2σ={s['coverage_2sigma']:.1f}%, 3σ={s['coverage_3sigma']:.1f}%")
+            print(f"{indent}    Z-score: mean={s['z_mean']:.3f}, std={s['z_std']:.3f}")
 
     if stratified_r2['stable']['r2'] is not None:
-        s = stratified_r2['stable']
-        print(f"{indent}  Stable (<{stable_max}% change):    R²={s['r2']:.4f}, "
-              f"RMSE={s['rmse']:.2f} Mg/ha ({s['n_shots']} shots, {s['n_tiles']} tiles)")
+        print_stratum(stratified_r2['stable'], f"Stable (<{stable_max}% change)")
     else:
-        print(f"{indent}  Stable (<{stable_max}% change):    Not enough data")
+        print(f"{indent}  Stable (<{stable_max}% change): Not enough data")
 
     if stratified_r2['moderate']['r2'] is not None:
-        m = stratified_r2['moderate']
-        print(f"{indent}  Moderate ({stable_max}-{disturbed_min}%):      R²={m['r2']:.4f}, "
-              f"RMSE={m['rmse']:.2f} Mg/ha ({m['n_shots']} shots, {m['n_tiles']} tiles)")
+        print_stratum(stratified_r2['moderate'], f"Moderate ({stable_max}-{disturbed_min}%)")
     else:
-        print(f"{indent}  Moderate ({stable_max}-{disturbed_min}%):      Not enough data")
+        print(f"{indent}  Moderate ({stable_max}-{disturbed_min}%): Not enough data")
 
     # Support both 'disturbed' (new) and 'fire' (legacy) keys
     disturbed_key = 'disturbed' if 'disturbed' in stratified_r2 else 'fire'
     if stratified_r2.get(disturbed_key, {}).get('r2') is not None:
-        d = stratified_r2[disturbed_key]
-        print(f"{indent}  Disturbed (>{disturbed_min}% loss): R²={d['r2']:.4f}, "
-              f"RMSE={d['rmse']:.2f} Mg/ha ({d['n_shots']} shots, {d['n_tiles']} tiles)")
+        print_stratum(stratified_r2[disturbed_key], f"Disturbed (>{disturbed_min}% loss)")
     else:
         print(f"{indent}  Disturbed (>{disturbed_min}% loss): Not enough data")
 
@@ -459,33 +504,75 @@ def compute_pooled_stratified_r2(
     moderate_mask = (pooled_df['disturbance'] >= stable_max) & (pooled_df['disturbance'] <= disturbed_min) & (~pooled_df['disturbance'].isna())
     disturbed_mask = (pooled_df['disturbance'] > disturbed_min) & (~pooled_df['disturbance'].isna())
 
+    # Use log-space columns if available (consistent with training)
+    use_log_space = 'pred_log' in pooled_df.columns and 'agbd_log' in pooled_df.columns
+    has_uncertainty = 'unc_log' in pooled_df.columns
+
+    # Default stratum result structure
+    default_stratum = {
+        'r2': None, 'rmse': None, 'mae': None, 'bias': None,
+        'z_mean': None, 'z_std': None,
+        'coverage_1sigma': None, 'coverage_2sigma': None, 'coverage_3sigma': None,
+        'n_shots': 0, 'n_tiles': 0
+    }
+
     results = {
-        'stable': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
-        'moderate': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
-        'disturbed': {'r2': None, 'rmse': None, 'n_shots': 0, 'n_tiles': 0},
+        'stable': default_stratum.copy(),
+        'moderate': default_stratum.copy(),
+        'disturbed': default_stratum.copy(),
         'thresholds': thresholds,
         'pooled': True,
+        'log_space': use_log_space,
         'total_tiles': len(tile_df),
         'total_shots': len(pooled_df)
     }
+
+    pred_col = 'pred_log' if use_log_space else 'pred'
+    target_col = 'agbd_log' if use_log_space else 'agbd'
 
     def compute_stratum(mask, name):
         subset = pooled_df[mask]
         if len(subset) < 10:
             return None
-        valid = ~subset['pred'].isna()
+        valid = ~subset[pred_col].isna()
         if valid.sum() < 10:
             return None
-        preds = subset.loc[valid, 'pred'].values
-        targets = subset.loc[valid, 'agbd'].values
+        preds = subset.loc[valid, pred_col].values
+        targets = subset.loc[valid, target_col].values
+        errors = preds - targets
+
+        # Core metrics
         r2 = r2_score(targets, preds)
-        rmse = np.sqrt(np.mean((preds - targets) ** 2))
-        return {
+        rmse = np.sqrt(np.mean(errors ** 2))
+        mae = np.mean(np.abs(errors))
+        bias = np.mean(errors)
+
+        result = {
             'r2': float(r2),
             'rmse': float(rmse),
+            'mae': float(mae),
+            'bias': float(bias),
             'n_shots': int(valid.sum()),
             'n_tiles': int(subset['tile_id'].nunique())
         }
+
+        # Compute calibration metrics if uncertainties available
+        if has_uncertainty:
+            valid_unc = valid & ~subset['unc_log'].isna()
+            if valid_unc.sum() >= 10:
+                unc = subset.loc[valid_unc, 'unc_log'].values
+                p = subset.loc[valid_unc, pred_col].values
+                t = subset.loc[valid_unc, target_col].values
+                z_scores = (t - p) / (unc + 1e-8)
+                abs_z = np.abs(z_scores)
+
+                result['z_mean'] = float(np.mean(z_scores))
+                result['z_std'] = float(np.std(z_scores))
+                result['coverage_1sigma'] = float(np.sum(abs_z <= 1.0) / len(z_scores) * 100)
+                result['coverage_2sigma'] = float(np.sum(abs_z <= 2.0) / len(z_scores) * 100)
+                result['coverage_3sigma'] = float(np.sum(abs_z <= 3.0) / len(z_scores) * 100)
+
+        return result
 
     for mask, name in [(stable_mask, 'stable'), (moderate_mask, 'moderate'), (disturbed_mask, 'disturbed')]:
         result = compute_stratum(mask, name)
