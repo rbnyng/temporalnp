@@ -17,7 +17,8 @@ def initialize_model(
         latent_dim=config.get('latent_dim', 128),
         output_uncertainty=True,
         architecture_mode=config.get('architecture_mode', 'deterministic'),
-        num_attention_heads=config.get('num_attention_heads', 4)
+        num_attention_heads=config.get('num_attention_heads', 4),
+        coord_dim=config.get('coord_dim', 2)
     ).to(device)
 
     return model
@@ -54,6 +55,25 @@ def load_checkpoint(
     return checkpoint, checkpoint_path
 
 
+def infer_coord_dim(state_dict: dict, config: dict) -> int:
+    """Infer coord_dim from checkpoint weights when not in config.
+
+    The context_encoder.fc1 input size = coord_dim + embedding_feature_dim + 1 (agbd).
+    So coord_dim = fc1_input_size - embedding_feature_dim - 1.
+    """
+    if 'coord_dim' in config:
+        return config['coord_dim']
+
+    key = 'context_encoder.fc1.weight'
+    if key in state_dict:
+        fc1_input = state_dict[key].shape[1]
+        emb_dim = config.get('embedding_feature_dim', 128)
+        coord_dim = fc1_input - emb_dim - 1
+        return coord_dim
+
+    return 2
+
+
 def load_model_from_checkpoint(
     checkpoint_dir: Path,
     device: str = 'cpu',
@@ -64,13 +84,16 @@ def load_model_from_checkpoint(
     config_path = checkpoint_dir / 'config.json'
     config = load_config(config_path)
 
-    model = initialize_model(config, device)
-
     checkpoint, checkpoint_path = load_checkpoint(
         checkpoint_dir, device, checkpoint_name
     )
 
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Infer coord_dim from weights if not in config
+    state_dict = checkpoint['model_state_dict']
+    config['coord_dim'] = infer_coord_dim(state_dict, config)
+
+    model = initialize_model(config, device)
+    model.load_state_dict(state_dict)
     model.eval()
 
     return model, checkpoint, checkpoint_path
