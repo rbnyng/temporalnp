@@ -495,9 +495,12 @@ class AlphaEarthExtractor(BaseEmbeddingExtractor):
         width = int((x_max - x_min) / 10)
         height = int((y_max - y_min) / 10)
 
-        # Split bands into chunks to stay under EE's 48MB computePixels limit.
-        # 8 bands × ~1100×1100 × 4 bytes ≈ 38MB per chunk.
-        BANDS_PER_CHUNK = 8
+        # Dynamically compute bands per chunk to stay under EE's 48MB limit.
+        # EE seems to use ~8 bytes/pixel internally (not 4), so be conservative.
+        MAX_BYTES = 48 * 1024 * 1024  # 48MB
+        BYTES_PER_PIXEL_PER_BAND = 8  # conservative: EE uses ~8 bytes internally
+        pixels_per_band = width * height
+        BANDS_PER_CHUNK = max(1, MAX_BYTES // (pixels_per_band * BYTES_PER_PIXEL_PER_BAND))
         all_band_data = []
 
         for chunk_start in range(0, len(self.EMBEDDING_BANDS), BANDS_PER_CHUNK):
