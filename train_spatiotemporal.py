@@ -28,7 +28,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from data.gedi import GEDIQuerier
-from data.embeddings import EmbeddingExtractor
+from data.embeddings import EmbeddingExtractor, create_embedding_extractor, EMBEDDING_SOURCES
 from data.dataset import (
     GEDISpatiotemporalDataset,
     CrossYearSpatiotemporalDataset,
@@ -66,6 +66,11 @@ def parse_args():
                         help='Directory for caching GEDI query results')
     parser.add_argument('--embeddings_dir', type=str, default='./embeddings',
                         help='Directory where geotessera stores embedding tiles')
+    parser.add_argument('--embedding_source', type=str, default='geotessera',
+                        choices=['geotessera', 'alphaearth'],
+                        help='Embedding source: geotessera (128D) or alphaearth (64D)')
+    parser.add_argument('--ee_project', type=str, default=None,
+                        help='Google Cloud project ID for Earth Engine (alphaearth only)')
 
     # Model arguments
     parser.add_argument('--patch_size', type=int, default=3,
@@ -650,12 +655,15 @@ def main():
         print("No GEDI data found in region. Exiting.")
         return
 
-    # Step 2: Extract embeddings for each year (reuse same extractor to avoid reinitializing GeoTessera)
-    print("Step 2: Extracting GeoTessera embeddings...")
-    extractor = EmbeddingExtractor(
+    # Step 2: Extract embeddings for each year
+    embedding_channels = EMBEDDING_SOURCES[args.embedding_source]['channels']
+    print(f"Step 2: Extracting {args.embedding_source} embeddings ({embedding_channels}D)...")
+    extractor = create_embedding_extractor(
+        source=args.embedding_source,
         year=all_years[0],
         patch_size=args.patch_size,
-        embeddings_dir=args.embeddings_dir
+        embeddings_dir=args.embeddings_dir,
+        ee_project=args.ee_project,
     )
 
     all_dfs = []
@@ -715,6 +723,7 @@ def main():
 
     config['global_bounds'] = list(global_bounds)
     config['temporal_bounds'] = list(temporal_bounds)
+    config['embedding_channels'] = embedding_channels
     save_config(config, output_dir / 'config.json')
 
     print(f"Global spatial bounds: lon [{global_bounds[0]:.4f}, {global_bounds[2]:.4f}], "
@@ -802,7 +811,7 @@ def main():
 
     model = GEDINeuralProcess(
         patch_size=args.patch_size,
-        embedding_channels=128,
+        embedding_channels=embedding_channels,
         embedding_feature_dim=args.embedding_feature_dim,
         context_repr_dim=args.context_repr_dim,
         hidden_dim=args.hidden_dim,

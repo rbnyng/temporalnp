@@ -37,7 +37,7 @@ except ImportError:
 
 from baselines.models import QuantileRandomForest, QuantileXGBoost
 from data.gedi import GEDIQuerier
-from data.embeddings import EmbeddingExtractor
+from data.embeddings import EmbeddingExtractor, create_embedding_extractor, EMBEDDING_SOURCES
 from data.dataset import compute_temporal_encoding
 from data.spatial_cv import SpatiotemporalSplitter
 from utils.config import save_config, _make_serializable
@@ -94,6 +94,11 @@ def parse_args():
                         help='GEDI cache directory')
     parser.add_argument('--embeddings_dir', type=str, default='./embeddings',
                         help='Embeddings directory')
+    parser.add_argument('--embedding_source', type=str, default='geotessera',
+                        choices=['geotessera', 'alphaearth'],
+                        help='Embedding source: geotessera (128D) or alphaearth (64D)')
+    parser.add_argument('--ee_project', type=str, default=None,
+                        help='Google Cloud project ID for Earth Engine (alphaearth only)')
     parser.add_argument('--n_jobs', type=int, default=-1,
                         help='Number of parallel jobs for RF (-1 for all cores)')
     parser.add_argument('--val_ratio', type=float, default=0.15,
@@ -591,6 +596,7 @@ def main():
         'min_samples_leaf': args.min_samples_leaf,
         'include_temporal': args.include_temporal,
         'patch_size': args.patch_size,
+        'embedding_source': args.embedding_source,
         'n_seeds': args.n_seeds,
         'start_seed': args.start_seed,
         'started_at': datetime.now().isoformat()
@@ -626,11 +632,13 @@ def main():
     print(f"Shots per year: {dict(gedi_df['year'].value_counts().sort_index())}")
 
     # Extract embeddings
-    print("\nStep 2: Extracting GeoTessera embeddings...")
-    extractor = EmbeddingExtractor(
+    print(f"\nStep 2: Extracting {args.embedding_source} embeddings...")
+    extractor = create_embedding_extractor(
+        source=args.embedding_source,
         year=all_years[0],
         patch_size=args.patch_size,
-        embeddings_dir=args.embeddings_dir
+        embeddings_dir=args.embeddings_dir,
+        ee_project=args.ee_project,
     )
 
     all_dfs = []

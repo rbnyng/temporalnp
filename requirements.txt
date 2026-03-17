@@ -19,3 +19,4 @@ seaborn>=0.12.0
 tqdm>=4.65.0
 pyyaml>=6.0
 pykrige>=1.7.0
+earthengine-api>=1.1.0  # Optional: for AlphaEarth embeddings

@@ -38,7 +38,7 @@ from tqdm import tqdm
 from typing import Optional, Tuple, Dict, List
 
 from data.gedi import GEDIQuerier
-from data.embeddings import EmbeddingExtractor
+from data.embeddings import EmbeddingExtractor, create_embedding_extractor
 from data.dataset import compute_temporal_encoding
 from utils.normalization import normalize_coords, normalize_agbd, denormalize_agbd, denormalize_std
 from utils.model import load_model_from_checkpoint
@@ -508,11 +508,13 @@ def main():
     )
     print(f"Grid: {len(lats)} x {len(lons)} = {len(lats)*len(lons):,} pixels")
 
-    # Initialize embedding extractor
-    extractor = EmbeddingExtractor(
+    # Initialize embedding extractor (use source from model config)
+    embedding_source = config.get('embedding_source', 'geotessera')
+    extractor = create_embedding_extractor(
+        source=embedding_source,
         year=years[0],
         patch_size=config.get('patch_size', 3),
-        embeddings_dir=args.embeddings_dir
+        embeddings_dir=args.embeddings_dir,
     )
 
     # Query GEDI context shots for each context year

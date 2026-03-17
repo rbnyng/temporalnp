@@ -77,6 +77,13 @@ def parse_args():
     parser.add_argument('--cross_year_training', action='store_true',
                         help='Train with cross-year context/target splits (pairs with --temporal_context)')
 
+    # Embedding source
+    parser.add_argument('--embedding_source', type=str, default='geotessera',
+                        choices=['geotessera', 'alphaearth'],
+                        help='Embedding source: geotessera (128D) or alphaearth (64D)')
+    parser.add_argument('--ee_project', type=str, default=None,
+                        help='Google Cloud project ID for Earth Engine (alphaearth only)')
+
     # Infrastructure
     parser.add_argument('--cache_dir', type=str, default='./cache',
                         help='GEDI cache directory')
@@ -105,8 +112,13 @@ def run_single_seed(seed: int, args, seed_output_dir: Path) -> dict:
         '--max_target_shots', str(args.max_target_shots),
         '--cache_dir', args.cache_dir,
         '--embeddings_dir', args.embeddings_dir,
+        '--embedding_source', args.embedding_source,
         '--device', args.device,
     ]
+
+    # Add optional Earth Engine project
+    if args.ee_project:
+        cmd.extend(['--ee_project', args.ee_project])
 
     # Add optional fire shapefile filter
     if args.fire_shapefile:
@@ -290,6 +302,7 @@ def main():
         'no_temporal_encoding': args.no_temporal_encoding,
         'temporal_context': args.temporal_context,
         'cross_year_training': args.cross_year_training,
+        'embedding_source': args.embedding_source,
         'started_at': datetime.now().isoformat()
     }
 

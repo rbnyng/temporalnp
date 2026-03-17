@@ -13,7 +13,7 @@ from scipy.spatial import cKDTree
 from typing import Optional, Tuple, Union
 import pickle
 from data.gedi import GEDIQuerier
-from data.embeddings import EmbeddingExtractor
+from data.embeddings import EmbeddingExtractor, create_embedding_extractor
 from utils.normalization import normalize_coords, normalize_agbd, denormalize_agbd, denormalize_std
 from utils.model import load_model_from_checkpoint
 from utils.config import load_config, get_global_bounds
@@ -508,11 +508,13 @@ def main():
     else:
         print("Baseline model detected - no context shots needed")
 
-    print(f"\nInitializing GeoTessera extractor (year={args.embedding_year})...")
-    extractor = EmbeddingExtractor(
+    embedding_source = config.get('embedding_source', 'geotessera')
+    print(f"\nInitializing {embedding_source} extractor (year={args.embedding_year})...")
+    extractor = create_embedding_extractor(
+        source=embedding_source,
         year=args.embedding_year,
         patch_size=config.get('patch_size', 3),
-        embeddings_dir=args.embeddings_dir
+        embeddings_dir=args.embeddings_dir,
     )
 
     # embeddings for context (NP only)

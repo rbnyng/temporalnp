@@ -10,7 +10,7 @@ def initialize_model(
 ) -> GEDINeuralProcess:
     model = GEDINeuralProcess(
         patch_size=config.get('patch_size', 3),
-        embedding_channels=128,
+        embedding_channels=config.get('embedding_channels', 128),
         embedding_feature_dim=config.get('embedding_feature_dim', 128),
         context_repr_dim=config.get('context_repr_dim', 128),
         hidden_dim=config.get('hidden_dim', 512),
