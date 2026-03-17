@@ -468,18 +468,18 @@ class AlphaEarthExtractor(BaseEmbeddingExtractor):
     def _fetch_tile_from_ee(
         self, tile_lon: float, tile_lat: float
     ) -> Optional[Tuple[np.ndarray, str, object]]:
-        """Fetch a tile from Earth Engine as a numpy array."""
+        """Fetch a tile from Earth Engine as a numpy array.
+
+        A 0.1° tile at 10m with 64 bands is ~300MB, exceeding EE's 48MB
+        computePixels limit. We split into band-chunks of 8 bands each
+        (~38MB per request) and concatenate locally.
+        """
         import ee
         from rasterio.transform import Affine
 
         self._ensure_ee_initialized()
 
-        # Define tile region (0.1° x 0.1° around center)
         half = 0.05
-        region = ee.Geometry.Rectangle([
-            tile_lon - half, tile_lat - half,
-            tile_lon + half, tile_lat + half
-        ])
 
         # Get the appropriate UTM CRS for this location
         utm_zone = int((tile_lon + 180) / 6) + 1
@@ -487,101 +487,58 @@ class AlphaEarthExtractor(BaseEmbeddingExtractor):
         epsg_code = 32600 + utm_zone if hemisphere == 'N' else 32700 + utm_zone
         crs_string = f'EPSG:{epsg_code}'
 
-        # Download pixels via computePixels or getPixels
-        try:
-            # Use ee.data.computePixels for efficient download
-            request = {
-                'expression': self._ee_image,
-                'fileFormat': 'NUMPY_NDARRAY',
-                'grid': {
-                    'dimensions': {'width': 1100, 'height': 1100},
-                    'affineTransform': {
-                        'scaleX': 10,
-                        'shearX': 0,
-                        'translateX': 0,
-                        'scaleY': -10,
-                        'shearY': 0,
-                        'translateY': 0,
+        # Get UTM bounds
+        proj = Transformer.from_crs("EPSG:4326", crs_string, always_xy=True)
+        x_min, y_min = proj.transform(tile_lon - half, tile_lat - half)
+        x_max, y_max = proj.transform(tile_lon + half, tile_lat + half)
+
+        width = int((x_max - x_min) / 10)
+        height = int((y_max - y_min) / 10)
+
+        # Split bands into chunks to stay under EE's 48MB computePixels limit.
+        # 8 bands × ~1100×1100 × 4 bytes ≈ 38MB per chunk.
+        BANDS_PER_CHUNK = 8
+        all_band_data = []
+
+        for chunk_start in range(0, len(self.EMBEDDING_BANDS), BANDS_PER_CHUNK):
+            chunk_bands = self.EMBEDDING_BANDS[chunk_start:chunk_start + BANDS_PER_CHUNK]
+
+            try:
+                request = {
+                    'expression': self._ee_image.select(chunk_bands),
+                    'fileFormat': 'NUMPY_NDARRAY',
+                    'grid': {
+                        'dimensions': {'width': width, 'height': height},
+                        'affineTransform': {
+                            'scaleX': 10,
+                            'shearX': 0,
+                            'translateX': x_min,
+                            'scaleY': -10,
+                            'shearY': 0,
+                            'translateY': y_max,
+                        },
+                        'crsCode': crs_string,
                     },
-                    'crsCode': crs_string,
-                },
-                'bandIds': self.EMBEDDING_BANDS,
-            }
+                    'bandIds': chunk_bands,
+                }
 
-            # Get UTM bounds to set the affine transform correctly
-            proj = Transformer.from_crs("EPSG:4326", crs_string, always_xy=True)
-            x_min, y_min = proj.transform(tile_lon - half, tile_lat - half)
-            x_max, y_max = proj.transform(tile_lon + half, tile_lat + half)
+                pixels = ee.data.computePixels(request)
 
-            width = int((x_max - x_min) / 10)
-            height = int((y_max - y_min) / 10)
+                # Convert structured array to (H, W, n_bands_in_chunk)
+                chunk_arrays = [pixels[band] for band in chunk_bands]
+                chunk_data = np.stack(chunk_arrays, axis=-1).astype(np.float32)
+                all_band_data.append(chunk_data)
 
-            request['grid']['dimensions'] = {'width': width, 'height': height}
-            request['grid']['affineTransform']['translateX'] = x_min
-            request['grid']['affineTransform']['translateY'] = y_max  # Top-left Y
-
-            pixels = ee.data.computePixels(request)
-
-            # Convert structured array to (H, W, C)
-            bands = [pixels[band] for band in self.EMBEDDING_BANDS]
-            embedding = np.stack(bands, axis=-1).astype(np.float32)
-
-            # Build affine transform
-            transform = Affine(10, 0, x_min, 0, -10, y_max)
-
-            return (embedding, crs_string, transform)
-
-        except Exception as e:
-            # Fallback: use getRegion for smaller areas
-            print(f"  computePixels failed for ({tile_lon}, {tile_lat}), trying getRegion: {e}")
-            return self._fetch_tile_via_get_region(tile_lon, tile_lat, region, crs_string)
-
-    def _fetch_tile_via_get_region(
-        self, tile_lon: float, tile_lat: float,
-        region, crs_string: str
-    ) -> Optional[Tuple[np.ndarray, str, object]]:
-        """Fallback: fetch tile using getRegion (slower, for smaller areas)."""
-        import ee
-        from rasterio.transform import Affine
-
-        try:
-            # Sample at 10m scale
-            result = self._ee_image.sampleRectangle(
-                region=region,
-                defaultValue=0
-            )
-            info = result.getInfo()
-
-            if info is None or 'properties' not in info:
+            except Exception as e:
+                print(f"Warning: computePixels failed for bands {chunk_bands[0]}-{chunk_bands[-1]} "
+                      f"at ({tile_lon}, {tile_lat}): {e}")
                 return None
 
-            props = info['properties']
-            bands = []
-            for band_name in self.EMBEDDING_BANDS:
-                if band_name in props:
-                    bands.append(np.array(props[band_name], dtype=np.float32))
-                else:
-                    return None
+        # Concatenate all band chunks -> (H, W, 64)
+        embedding = np.concatenate(all_band_data, axis=-1)
 
-            embedding = np.stack(bands, axis=-1)
-
-            # Approximate affine transform
-            half = 0.05
-            proj = Transformer.from_crs("EPSG:4326", crs_string, always_xy=True)
-            x_min, y_min = proj.transform(tile_lon - half, tile_lat - half)
-            x_max, y_max = proj.transform(tile_lon + half, tile_lat + half)
-
-            height, width = embedding.shape[:2]
-            pixel_size_x = (x_max - x_min) / width
-            pixel_size_y = (y_max - y_min) / height
-
-            transform = Affine(pixel_size_x, 0, x_min, 0, -pixel_size_y, y_max)
-
-            return (embedding, crs_string, transform)
-
-        except Exception as e:
-            print(f"Warning: getRegion also failed for ({tile_lon}, {tile_lat}): {e}")
-            return None
+        transform = Affine(10, 0, x_min, 0, -10, y_max)
+        return (embedding, crs_string, transform)
 
     def _save_tile_to_cache(
         self, cache_path: Path, tile_data: Tuple[np.ndarray, str, object]
