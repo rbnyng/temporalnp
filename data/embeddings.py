@@ -329,8 +329,10 @@ class AlphaEarthExtractor(BaseEmbeddingExtractor):
     Uses Google Earth Engine to access the GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL
     image collection produced by AlphaEarth Foundations (Google DeepMind).
 
-    Embeddings are 64-dimensional unit-norm vectors derived from multi-sensor fusion
-    (Sentinel-2, Sentinel-1, Landsat, LiDAR, elevation, climate data).
+    Instead of downloading entire tiles (which exceeds EE's 48MB limit),
+    this extractor uses batch point sampling via ee.Image.sampleRegions()
+    with neighborhoodToArray() to extract small patches directly at shot
+    locations. This is much faster and avoids size limits entirely.
 
     Requires:
         - Earth Engine Python API: pip install earthengine-api
@@ -338,11 +340,12 @@ class AlphaEarthExtractor(BaseEmbeddingExtractor):
         - A Google Cloud project with Earth Engine enabled
     """
 
-    # AlphaEarth tiles are ~163,840m x 163,840m in UTM, organized by UTM zone.
-    # We access them as a continuous image collection and sample at point locations.
     COLLECTION_ID = 'GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL'
     EMBEDDING_BANDS = [f'A{i:02d}' for i in range(64)]
     EMBEDDING_CHANNELS = 64
+
+    # Max points per EE sampleRegions call (EE limit is ~5000 features)
+    BATCH_SIZE = 4000
 
     def __init__(
         self,
@@ -351,21 +354,12 @@ class AlphaEarthExtractor(BaseEmbeddingExtractor):
         project: Optional[str] = None,
         cache_dir: Optional[str] = None,
     ):
-        """
-        Initialize AlphaEarth embedding extractor.
-
-        Args:
-            year: Year of embeddings to use (2017-2025)
-            patch_size: Size of patch to extract around each shot (e.g., 3 = 3x3 = 30m x 30m)
-            project: Google Cloud project ID for Earth Engine. If None, uses default.
-            cache_dir: Directory for caching downloaded GeoTIFF tiles to disk.
-                      Tiles are cached as numpy arrays for fast reloading.
-        """
         super().__init__(year=year, patch_size=patch_size, embedding_channels=self.EMBEDDING_CHANNELS)
         self.project = project
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self._ee_initialized = False
         self._ee_image = None
+        self._ee_patch_image = None  # Image with neighborhoodToArray applied
 
     def _ensure_ee_initialized(self):
         """Lazily initialize Earth Engine on first use."""
@@ -380,7 +374,6 @@ class AlphaEarthExtractor(BaseEmbeddingExtractor):
             else:
                 ee.Initialize()
         except Exception:
-            # If default init fails, try high-volume endpoint
             try:
                 ee.Initialize(opt_url='https://earthengine-highvolume.googleapis.com')
             except Exception as e:
@@ -393,7 +386,7 @@ class AlphaEarthExtractor(BaseEmbeddingExtractor):
         self._load_ee_image()
 
     def _load_ee_image(self):
-        """Load the Earth Engine image for the current year."""
+        """Load the Earth Engine image and prepare neighborhood arrays."""
         import ee
 
         collection = ee.ImageCollection(self.COLLECTION_ID)
@@ -403,6 +396,12 @@ class AlphaEarthExtractor(BaseEmbeddingExtractor):
             .select(self.EMBEDDING_BANDS)
             .mosaic()
         )
+
+        # Pre-apply neighborhoodToArray: converts each band to a patch_size x patch_size
+        # array at each pixel. This allows sampleRegions to return patches.
+        radius = self.patch_size // 2
+        kernel = ee.Kernel.square(radius=radius, units='pixels')
+        self._ee_patch_image = self._ee_image.neighborhoodToArray(kernel)
 
     def set_year(self, year: int) -> None:
         if year != self.year:
@@ -415,146 +414,151 @@ class AlphaEarthExtractor(BaseEmbeddingExtractor):
     def source_name(self) -> str:
         return "AlphaEarth"
 
+    # -- Tile-based methods (not used, but required by ABC) --
+
     def _get_tile_coords(self, lon: float, lat: float) -> Tuple[float, float]:
-        # Use same 0.1° grid as GeoTessera for consistency
         tile_lon = round((lon - 0.05) / 0.1) * 0.1 + 0.05
         tile_lat = round((lat - 0.05) / 0.1) * 0.1 + 0.05
         return tile_lon, tile_lat
 
-    def _get_tile_cache_path(self, tile_lon: float, tile_lat: float) -> Optional[Path]:
-        """Get disk cache path for a tile."""
-        if self.cache_dir is None:
-            return None
-        tile_dir = self.cache_dir / 'alphaearth' / str(self.year)
-        tile_dir.mkdir(parents=True, exist_ok=True)
-        return tile_dir / f'tile_{tile_lon:.2f}_{tile_lat:.2f}.npz'
-
     def _load_tile(
         self, tile_lon: float, tile_lat: float
     ) -> Optional[Tuple[np.ndarray, object, object]]:
-        tile_key = (tile_lon, tile_lat)
+        # Not used — this extractor uses batch point sampling instead
+        return None
 
-        # Memory cache
-        if tile_key in self.tile_cache:
-            return self.tile_cache[tile_key]
+    # -- Batch point sampling (overrides the base class loop) --
 
-        # Disk cache
-        cache_path = self._get_tile_cache_path(tile_lon, tile_lat)
-        if cache_path is not None and cache_path.exists():
-            try:
-                data = np.load(cache_path, allow_pickle=True)
-                from rasterio.transform import Affine
-                transform = Affine(*data['transform'])
-                crs_str = str(data['crs'])
-                tile_data = (data['embedding'], crs_str, transform)
-                self.tile_cache[tile_key] = tile_data
-                return tile_data
-            except Exception as e:
-                print(f"Warning: Could not load cached tile ({tile_lon}, {tile_lat}): {e}")
-
-        # Fetch from Earth Engine
-        try:
-            tile_data = self._fetch_tile_from_ee(tile_lon, tile_lat)
-            if tile_data is not None:
-                self.tile_cache[tile_key] = tile_data
-                # Save to disk cache
-                if cache_path is not None:
-                    self._save_tile_to_cache(cache_path, tile_data)
-            return tile_data
-        except Exception as e:
-            print(f"Warning: Could not fetch AlphaEarth tile at ({tile_lon}, {tile_lat}): {e}")
-            return None
-
-    def _fetch_tile_from_ee(
-        self, tile_lon: float, tile_lat: float
-    ) -> Optional[Tuple[np.ndarray, str, object]]:
-        """Fetch a tile from Earth Engine as a numpy array.
-
-        A 0.1° tile at 10m with 64 bands is ~300MB, exceeding EE's 48MB
-        computePixels limit. We split into band-chunks of 8 bands each
-        (~38MB per request) and concatenate locally.
+    def extract_patches_batch(
+        self,
+        gedi_df: pd.DataFrame,
+        verbose: bool = True,
+        desc: str = None,
+        cache_dir: Optional[str] = None
+    ) -> pd.DataFrame:
         """
-        import ee
-        from rasterio.transform import Affine
+        Extract patches for all GEDI shots using batch EE point sampling.
+
+        Uses neighborhoodToArray + sampleRegions to extract patches at all
+        shot locations in batches, avoiding per-tile downloads entirely.
+        """
+        # Check cache first
+        if cache_dir is not None:
+            cache_key = self._generate_extraction_cache_key(gedi_df)
+            cache_path = self._get_extraction_cache_path(cache_dir, cache_key)
+
+            if cache_path.exists():
+                if verbose:
+                    print(f"  Loading cached embeddings from {cache_path}")
+                cached_df = self._load_cached_extractions(cache_path, gedi_df)
+                if cached_df is not None:
+                    successful = cached_df['embedding_patch'].notna().sum()
+                    if verbose:
+                        print(f"  {successful}/{len(cached_df)} shots with valid embeddings "
+                              f"({100*successful/len(cached_df):.1f}%) [from cache]")
+                    return cached_df
 
         self._ensure_ee_initialized()
 
-        half = 0.05
+        if desc is None:
+            desc = f"Extracting AlphaEarth embeddings (year {self.year})"
 
-        # Get the appropriate UTM CRS for this location
-        utm_zone = int((tile_lon + 180) / 6) + 1
-        hemisphere = 'N' if tile_lat >= 0 else 'S'
-        epsg_code = 32600 + utm_zone if hemisphere == 'N' else 32700 + utm_zone
-        crs_string = f'EPSG:{epsg_code}'
+        n_total = len(gedi_df)
+        patches = [None] * n_total
+        successful = 0
 
-        # Get UTM bounds
-        proj = Transformer.from_crs("EPSG:4326", crs_string, always_xy=True)
-        x_min, y_min = proj.transform(tile_lon - half, tile_lat - half)
-        x_max, y_max = proj.transform(tile_lon + half, tile_lat + half)
+        # Process in batches
+        indices = list(range(n_total))
+        n_batches = (n_total + self.BATCH_SIZE - 1) // self.BATCH_SIZE
 
-        width = int((x_max - x_min) / 10)
-        height = int((y_max - y_min) / 10)
+        if verbose:
+            batch_iter = tqdm(range(n_batches), desc=desc)
+        else:
+            batch_iter = range(n_batches)
 
-        BANDS_PER_CHUNK = 2
-        all_band_data = []
+        for batch_idx in batch_iter:
+            start = batch_idx * self.BATCH_SIZE
+            end = min(start + self.BATCH_SIZE, n_total)
+            batch_indices = indices[start:end]
 
-        for chunk_start in range(0, len(self.EMBEDDING_BANDS), BANDS_PER_CHUNK):
-            chunk_bands = self.EMBEDDING_BANDS[chunk_start:chunk_start + BANDS_PER_CHUNK]
+            batch_df = gedi_df.iloc[batch_indices]
+            batch_patches = self._sample_batch(batch_df)
 
-            try:
-                request = {
-                    'expression': self._ee_image.select(chunk_bands),
-                    'fileFormat': 'NUMPY_NDARRAY',
-                    'grid': {
-                        'dimensions': {'width': width, 'height': height},
-                        'affineTransform': {
-                            'scaleX': 10,
-                            'shearX': 0,
-                            'translateX': x_min,
-                            'scaleY': -10,
-                            'shearY': 0,
-                            'translateY': y_max,
-                        },
-                        'crsCode': crs_string,
-                    },
-                    'bandIds': chunk_bands,
-                }
+            for i, (idx, patch) in enumerate(zip(batch_indices, batch_patches)):
+                patches[idx] = patch
+                if patch is not None:
+                    successful += 1
 
-                pixels = ee.data.computePixels(request)
+        gedi_df = gedi_df.copy()
+        gedi_df['embedding_patch'] = patches
 
-                # Convert structured array to (H, W, n_bands_in_chunk)
-                chunk_arrays = [pixels[band] for band in chunk_bands]
-                chunk_data = np.stack(chunk_arrays, axis=-1).astype(np.float32)
-                all_band_data.append(chunk_data)
+        if verbose:
+            print(f"  {successful}/{n_total} shots with valid embeddings "
+                  f"({100*successful/n_total:.1f}%)")
 
-            except Exception as e:
-                print(f"Warning: computePixels failed for bands {chunk_bands[0]}-{chunk_bands[-1]} "
-                      f"at ({tile_lon}, {tile_lat}): {e}")
-                return None
+        if cache_dir is not None:
+            self._save_extractions_to_cache(cache_path, gedi_df)
 
-        # Concatenate all band chunks -> (H, W, 64)
-        embedding = np.concatenate(all_band_data, axis=-1)
+        return gedi_df
 
-        transform = Affine(10, 0, x_min, 0, -10, y_max)
-        return (embedding, crs_string, transform)
+    def _sample_batch(self, batch_df: pd.DataFrame) -> list:
+        """
+        Sample patches for a batch of points via EE sampleRegions.
 
-    def _save_tile_to_cache(
-        self, cache_path: Path, tile_data: Tuple[np.ndarray, str, object]
-    ) -> None:
-        """Save a downloaded tile to disk cache."""
-        embedding, crs, transform = tile_data
+        Returns list of numpy arrays (patch_size, patch_size, 64) or None.
+        """
+        import ee
+
+        # Create FeatureCollection from points
+        features = []
+        for i, (_, row) in enumerate(batch_df.iterrows()):
+            point = ee.Geometry.Point([float(row['longitude']), float(row['latitude'])])
+            features.append(ee.Feature(point, {'idx': i}))
+
+        fc = ee.FeatureCollection(features)
+
         try:
-            np.savez_compressed(
-                cache_path,
-                embedding=embedding,
-                crs=str(crs),
-                transform=np.array([
-                    transform.a, transform.b, transform.c,
-                    transform.d, transform.e, transform.f
-                ])
+            # Sample the neighborhood-array image at all points
+            # Each feature gets properties like A00 (a patch_size×patch_size list), A01, ...
+            sampled = self._ee_patch_image.sampleRegions(
+                collection=fc,
+                scale=10,
+                geometries=False
             )
+
+            results = sampled.getInfo()
+
+            if results is None or 'features' not in results:
+                return [None] * len(batch_df)
+
+            # Parse results back into patches, indexed by 'idx'
+            patches_by_idx = {}
+            ps = self.patch_size
+
+            for feature in results['features']:
+                props = feature['properties']
+                idx = props['idx']
+
+                try:
+                    band_arrays = []
+                    for band in self.EMBEDDING_BANDS:
+                        arr = props.get(band)
+                        if arr is None:
+                            raise ValueError(f"Missing band {band}")
+                        band_arrays.append(np.array(arr, dtype=np.float32).reshape(ps, ps))
+
+                    # Stack bands -> (patch_size, patch_size, 64)
+                    patch = np.stack(band_arrays, axis=-1)
+                    patches_by_idx[idx] = patch
+                except Exception:
+                    patches_by_idx[idx] = None
+
+            # Return in original order
+            return [patches_by_idx.get(i) for i in range(len(batch_df))]
+
         except Exception as e:
-            print(f"Warning: Could not cache tile: {e}")
+            print(f"Warning: EE sampleRegions failed for batch of {len(batch_df)}: {e}")
+            return [None] * len(batch_df)
 
 
 def create_embedding_extractor(
